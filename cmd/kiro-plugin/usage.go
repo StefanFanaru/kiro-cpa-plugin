@@ -380,6 +380,21 @@ func carryHostOwnedFields(from *kiroauth.KiroTokenData, to *kiroauth.KiroTokenDa
 	if to.Email == "" {
 		to.Email = from.Email
 	}
+	// The display label is derived from these. An OIDC refresh returns token
+	// material only, so without them every refresh rewrote a Builder ID card as
+	// the bare "Kiro Builder ID".
+	if to.AWSUserID == "" {
+		to.AWSUserID = from.AWSUserID
+	}
+	if to.Identity == "" {
+		to.Identity = from.Identity
+	}
+	if to.ProfileName == "" {
+		to.ProfileName = from.ProfileName
+	}
+	if to.SubscriptionTitle == "" {
+		to.SubscriptionTitle = from.SubscriptionTitle
+	}
 	if to.Provider == "" {
 		to.Provider = from.Provider
 	}

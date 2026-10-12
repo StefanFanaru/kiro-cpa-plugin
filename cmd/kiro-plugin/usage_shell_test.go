@@ -99,12 +99,16 @@ func TestUsageDataAndActionsAreManagementRoutes(t *testing.T) {
 	}
 	for path, method := range map[string]string{
 		usageViewRoute:               http.MethodGet,
-		usageCredentialRoute:         http.MethodPost,
 		"/plugins/kiro/capabilities": http.MethodGet,
 	} {
 		if routes[path] != method {
 			t.Fatalf("%s %s is not registered: %+v", method, path, registration.Routes)
 		}
+	}
+	// The page cannot disable a credential: host.auth.save rebuilds the record
+	// without reading disabled, so CPA flipped the flag straight back.
+	if _, ok := routes["/plugins/kiro/usage/credential"]; ok {
+		t.Fatal("the credential toggle route is registered again")
 	}
 	if _, ok := routes["/plugins/kiro/usage"]; ok {
 		t.Fatal("the old HTML usage route is still registered")
@@ -145,13 +149,14 @@ func TestUsageViewControlsAreButtons(t *testing.T) {
 	for _, expected := range []string{
 		`<button type="button" class="act" data-refresh="all">`,
 		`<button type="button" class="act" data-refresh="kiro-a.json">`,
-		`<button type="button" class="act" data-credential="kiro-a.json" data-disabled="true" data-confirm="`,
-		`<button type="button" class="act" data-credential="kiro-b.json" data-disabled="false">`,
 		`<a class="act primary" href="/management.html#/oauth" target="_top">`,
 	} {
 		if !strings.Contains(html, expected) {
 			t.Fatalf("fragment is missing %q: %s", expected, html)
 		}
+	}
+	if strings.Contains(html, "data-credential") {
+		t.Fatal("the fragment still offers the credential toggle")
 	}
 	if strings.Contains(html, `data-refresh="kiro-b.json"`) {
 		t.Fatal("a disabled credential offered a quota reload")

@@ -225,22 +225,19 @@ const usageShellText = `  var TEXT = {
       title: 'Kiro Usage',
       loading: 'Loading Kiro usage…',
       keyPrompt: 'Enter the CLIProxyAPI management key to view Kiro usage.',
-      loadFailed: 'Kiro usage could not be loaded: {message}',
-      actionFailed: 'The credential could not be changed: {message}'
+      loadFailed: 'Kiro usage could not be loaded: {message}'
     },
     vi: {
       title: 'Hạn mức Kiro',
       loading: 'Đang tải hạn mức Kiro…',
       keyPrompt: 'Nhập management key của CLIProxyAPI để xem hạn mức Kiro.',
-      loadFailed: 'Không tải được hạn mức Kiro: {message}',
-      actionFailed: 'Không đổi được credential: {message}'
+      loadFailed: 'Không tải được hạn mức Kiro: {message}'
     },
     'zh-CN': {
       title: 'Kiro 用量',
       loading: '正在加载 Kiro 用量…',
       keyPrompt: '请输入 CLIProxyAPI 管理密钥以查看 Kiro 用量。',
-      loadFailed: '无法加载 Kiro 用量：{message}',
-      actionFailed: '无法更改凭证：{message}'
+      loadFailed: '无法加载 Kiro 用量：{message}'
     }
   };
 `
@@ -292,7 +289,7 @@ const usageShellLogic = `  var busy = false;
     function setBusy(flag) {
       busy = flag;
       host.setAttribute('aria-busy', flag ? 'true' : 'false');
-      var controls = host.querySelectorAll('button[data-refresh], button[data-credential]');
+      var controls = host.querySelectorAll('button[data-refresh]');
       for (var index = 0; index < controls.length; index += 1) {
         controls[index].disabled = flag;
       }
@@ -426,42 +423,16 @@ const usageShellLogic = `  var busy = false;
         });
     }
 
-    function setCredential(file, disabled) {
-      setBusy(true);
-      request('usage/credential', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: file, disabled: disabled })
-      })
-        .then(function () {
-          setBusy(false);
-          load('');
-        })
-        .catch(function (error) {
-          setBusy(false);
-          failWith(t('actionFailed'))(error);
-        });
-    }
-
     host.addEventListener('click', function (event) {
       var target = event.target;
       if (!target || !target.closest) {
         return;
       }
-      var control = target.closest('button[data-refresh], button[data-credential]');
+      var control = target.closest('button[data-refresh]');
       if (control) {
-        if (busy) {
-          return;
-        }
-        if (control.hasAttribute('data-refresh')) {
+        if (!busy) {
           load(control.getAttribute('data-refresh'));
-          return;
         }
-        var question = control.getAttribute('data-confirm');
-        if (question && !window.confirm(question)) {
-          return;
-        }
-        setCredential(control.getAttribute('data-credential'), control.getAttribute('data-disabled') === 'true');
         return;
       }
       if (target.closest('a,button,input,select,textarea')) {
@@ -723,6 +694,5 @@ const usageViewHTML = `<div class="kiro-view" lang="{{.Options.Lang}}" data-text
 {{if $account.FileName}}<span class="actions">
   {{if needsAttention $account}}<a class="act primary" href="/management.html#/oauth" target="_top">{{text "action_relogin"}}</a>{{end}}
   {{if ne $account.StateKey "disabled"}}<button type="button" class="act" data-refresh="{{$account.FileName}}">{{text "action_refresh"}}</button>{{end}}
-  {{if eq $account.StateKey "disabled"}}<button type="button" class="act" data-credential="{{$account.FileName}}" data-disabled="false">{{text "action_enable"}}</button>{{else}}<button type="button" class="act" data-credential="{{$account.FileName}}" data-disabled="true" data-confirm="{{text "confirm_disable"}}">{{text "action_disable"}}</button>{{end}}
 </span>{{end}}
 {{end}}`

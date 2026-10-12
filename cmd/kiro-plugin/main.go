@@ -305,7 +305,6 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: http.MethodPost, Path: "/plugins/kiro/connect"},
 				{Method: http.MethodGet, Path: "/plugins/kiro/capabilities"},
 				{Method: http.MethodGet, Path: usageViewRoute},
-				{Method: http.MethodPost, Path: usageCredentialRoute},
 			},
 			// Resource routes are served without the management key, so they are
 			// only static shells; their data and actions go through the routes
@@ -2045,8 +2044,6 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return handleConnectAPI(req)
 	case managementBasePath + usageViewRoute:
 		return handleUsageView(req)
-	case managementBasePath + usageCredentialRoute:
-		return handleUsageCredential(req)
 	case resourceBasePath + usageResourcePath:
 		return handleUsageShell()
 	case resourceBasePath + loginResourcePath:

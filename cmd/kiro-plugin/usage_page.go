@@ -137,9 +137,6 @@ var usagePageTextPacks = map[string]usagePageText{
 		"action_refresh":        "Reload quota",
 		"action_refresh_all":    "Reload all quotas",
 		"action_relogin":        "Sign in again",
-		"action_disable":        "Disable",
-		"action_enable":         "Enable",
-		"confirm_disable":       "Disable this Kiro credential? CLIProxyAPI stops routing requests to it until it is enabled again.",
 	},
 	usageLangVI: {
 		"title":                 "Hạn mức Kiro",
@@ -243,9 +240,6 @@ var usagePageTextPacks = map[string]usagePageText{
 		"action_refresh":        "Tải lại quota",
 		"action_refresh_all":    "Tải lại tất cả",
 		"action_relogin":        "Đăng nhập lại",
-		"action_disable":        "Tắt",
-		"action_enable":         "Bật",
-		"confirm_disable":       "Tắt credential Kiro này? CLIProxyAPI sẽ ngừng chuyển request tới nó cho tới khi bật lại.",
 	},
 	usageLangZH: {
 		"title":                 "Kiro 用量",
@@ -349,9 +343,6 @@ var usagePageTextPacks = map[string]usagePageText{
 		"action_refresh":        "刷新额度",
 		"action_refresh_all":    "全部刷新",
 		"action_relogin":        "重新登录",
-		"action_disable":        "停用",
-		"action_enable":         "启用",
-		"confirm_disable":       "停用此 Kiro 凭证？在重新启用之前，CLIProxyAPI 不会再向它转发请求。",
 	},
 }
 

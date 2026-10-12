@@ -128,46 +128,6 @@ func TestUsageRefreshSelectorForcesOnlyTheNamedCredential(t *testing.T) {
 	}
 }
 
-func postUsageCredential(t *testing.T, method, body string) pluginapi.ManagementResponse {
-	t.Helper()
-	return serveManagement(t, pluginapi.ManagementRequest{Method: method, Path: managementBasePath + usageCredentialRoute, Body: []byte(body)})
-}
-
-// The toggle flips only the disabled flag of the named credential.
-func TestUsageCredentialTogglesOnlyTheDisabledFlag(t *testing.T) {
-	_, saved := usageFixture(t)
-	response := postUsageCredential(t, http.MethodPost, `{"file":"kiro-a.json","disabled":true}`)
-	if response.StatusCode != http.StatusOK || response.Headers.Get("Content-Type") != "application/json" {
-		t.Fatalf("status = %d, body %s", response.StatusCode, response.Body)
-	}
-	var echoed struct {
-		File     string `json:"file"`
-		Disabled bool   `json:"disabled"`
-	}
-	if err := json.Unmarshal(response.Body, &echoed); err != nil || echoed.File != "kiro-a.json" || !echoed.Disabled {
-		t.Fatalf("response body = %s (%v)", response.Body, err)
-	}
-	document := saved["kiro-a.json"]
-	if document["disabled"] != true || document["note"] != "a@example.com" || document["accessToken"] != "a-token" || len(saved) != 1 {
-		t.Fatalf("saved = %+v", saved)
-	}
-	if response := postUsageCredential(t, http.MethodPost, `{"file":"../kiro-b.json","disabled":false}`); response.StatusCode != http.StatusOK || saved["kiro-b.json"]["disabled"] != false {
-		t.Fatalf("a path prefix must reduce to the file name: %d %s", response.StatusCode, response.Body)
-	}
-
-	for _, body := range []string{`{"file":"kiro-a.json"}`, `{"disabled":true}`, `{"file":"","disabled":true}`, `not json`} {
-		if response := postUsageCredential(t, http.MethodPost, body); response.StatusCode != http.StatusBadRequest {
-			t.Fatalf("%s: status = %d, want 400", body, response.StatusCode)
-		}
-	}
-	if response := postUsageCredential(t, http.MethodGet, `{"file":"kiro-a.json","disabled":false}`); response.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("GET: status = %d, want 405", response.StatusCode)
-	}
-	if response := postUsageCredential(t, http.MethodPost, `{"file":"kiro-missing.json","disabled":false}`); response.StatusCode != http.StatusBadGateway {
-		t.Fatalf("unknown file: status = %d", response.StatusCode)
-	}
-}
-
 // The account cell leads with the credential file name; the note sits under
 // it only when the file has one, and the synthetic label is not the title.
 func TestUsageCellShowsFileNameThenNote(t *testing.T) {

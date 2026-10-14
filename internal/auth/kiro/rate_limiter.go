@@ -14,6 +14,13 @@ const (
 	DefaultSuspendCooldown  = 1 * time.Hour
 )
 
+// Reasons a credential is taken out of rotation. The executor maps them to the
+// status it refuses the parked credential with.
+const (
+	ReasonMonthlyLimit = "monthly limit reached"
+	ReasonSuspended    = "account suspended"
+)
+
 // RateLimiter paces requests per credential and takes a credential out of
 // rotation when Kiro reports a condition that does not survive the RPC
 // boundary as a duration. Credential selection, failover and the 429 backoff
@@ -125,7 +132,7 @@ func (rl *RateLimiter) MarkUnavailable(tokenKey, reason string, window time.Dura
 
 // MarkSuspended applies the configured suspension cooldown to the credential.
 func (rl *RateLimiter) MarkSuspended(tokenKey string) {
-	rl.MarkUnavailable(tokenKey, "account suspended", rl.suspendCooldown)
+	rl.MarkUnavailable(tokenKey, ReasonSuspended, rl.suspendCooldown)
 }
 
 // TokenUnavailable reports why a credential is out of rotation and for how

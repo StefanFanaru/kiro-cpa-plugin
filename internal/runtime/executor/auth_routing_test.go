@@ -151,11 +151,12 @@ func TestQuotaErrorsStopAtCredentialBoundary(t *testing.T) {
 		name   string
 		status int
 		stream bool
+		want   int
 	}{
-		{name: "non-stream 429", status: http.StatusTooManyRequests},
-		{name: "stream 429", status: http.StatusTooManyRequests, stream: true},
-		{name: "non-stream 402", status: http.StatusPaymentRequired},
-		{name: "stream 402", status: http.StatusPaymentRequired, stream: true},
+		{name: "non-stream 429", status: http.StatusTooManyRequests, want: http.StatusTooManyRequests},
+		{name: "stream 429", status: http.StatusTooManyRequests, stream: true, want: http.StatusTooManyRequests},
+		{name: "non-stream 402", status: http.StatusPaymentRequired, want: http.StatusPaymentRequired},
+		{name: "stream 402", status: http.StatusPaymentRequired, stream: true, want: http.StatusPaymentRequired},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			requests := 0
@@ -181,8 +182,8 @@ func TestQuotaErrorsStopAtCredentialBoundary(t *testing.T) {
 				_, err = NewKiroExecutor(nil).Execute(t.Context(), auth, request, options)
 			}
 			statusErr, ok := err.(interface{ StatusCode() int })
-			if !ok || statusErr.StatusCode() != http.StatusTooManyRequests {
-				t.Fatalf("quota error = %T %v, want HTTP 429", err, err)
+			if !ok || statusErr.StatusCode() != test.want {
+				t.Fatalf("quota error = %T %v, want HTTP %d", err, err, test.want)
 			}
 			if requests != 1 {
 				t.Fatalf("quota error made %d upstream requests, want 1", requests)
@@ -260,16 +261,18 @@ func TestUpstream429IsForwardedWithoutPluginCooldown(t *testing.T) {
 // A 402 monthly limit and a 403 suspension are the two conditions the plugin
 // must remember itself: the host's ladder would retry within seconds and the
 // retry-after does not cross the RPC boundary. The credential is refused
-// locally with a 429 until the window ends.
+// locally until the window ends, with the status CPA cools longest for: 402
+// for the monthly limit, 403 for a suspension.
 func TestMonthlyLimitAndSuspensionParkTheCredentialLocally(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		status int
 		body   string
 		reason string
+		local  int
 	}{
-		{name: "402 monthly limit", status: http.StatusPaymentRequired, body: "{\"message\":\"MONTHLY_REQUEST_COUNT\"}", reason: "monthly limit reached"},
-		{name: "403 suspended", status: http.StatusForbidden, body: "{\"reason\":\"TEMPORARILY_SUSPENDED\"}", reason: "account suspended"},
+		{name: "402 monthly limit", status: http.StatusPaymentRequired, body: "{\"message\":\"MONTHLY_REQUEST_COUNT\"}", reason: "monthly limit reached", local: http.StatusPaymentRequired},
+		{name: "403 suspended", status: http.StatusForbidden, body: "{\"reason\":\"TEMPORARILY_SUSPENDED\"}", reason: "account suspended", local: http.StatusForbidden},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			requests := 0
@@ -285,8 +288,8 @@ func TestMonthlyLimitAndSuspensionParkTheCredentialLocally(t *testing.T) {
 			}
 			_, err := NewKiroExecutor(nil).ExecuteStream(t.Context(), auth, request, options)
 			statusErr, ok := err.(interface{ StatusCode() int })
-			if !ok || statusErr.StatusCode() != http.StatusTooManyRequests || !strings.Contains(err.Error(), test.reason) {
-				t.Fatalf("parked credential = %T %v, want local 429 mentioning %q", err, err, test.reason)
+			if !ok || statusErr.StatusCode() != test.local || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("parked credential = %T %v, want local %d mentioning %q", err, err, test.local, test.reason)
 			}
 			retryAfter, ok := err.(interface{ RetryAfter() *time.Duration })
 			if !ok || retryAfter.RetryAfter() == nil || *retryAfter.RetryAfter() <= 0 {
@@ -475,5 +478,19 @@ func TestAPIKeyAuthErrorsDoNotEnterOAuthRefresh(t *testing.T) {
 				t.Fatalf("API-key auth error made %d upstream requests, want 1", requests)
 			}
 		})
+	}
+}
+
+// The local refusal status decides CPA's cooldown, because CPA cannot read the
+// plugin's retry-after. Unknown reasons keep the 429 ladder.
+func TestUnavailableStatusByReason(t *testing.T) {
+	for reason, want := range map[string]int{
+		kiroauth.ReasonMonthlyLimit: http.StatusPaymentRequired,
+		kiroauth.ReasonSuspended:    http.StatusForbidden,
+		"something else":            http.StatusTooManyRequests,
+	} {
+		if got := unavailableStatus(reason); got != want {
+			t.Fatalf("unavailableStatus(%q) = %d, want %d", reason, got, want)
+		}
 	}
 }

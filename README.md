@@ -14,14 +14,14 @@ The plugin:
 - supports streaming, tool calls, token refresh, multiple accounts, and failover;
 - forwards client-executed function tools, bounds their descriptions to Kiro's upstream limit, and omits server-side tools that Kiro cannot execute;
 - preserves system and developer instructions exactly once, anchored to the first user turn, because the upstream `systemPrompt` field is feature-gated;
-- provides a `Kiro Usage` page for subscription usage, with per-account reload and enable/disable.
+- provides a read-only `Kiro Usage` page for subscription usage, with per-account reload.
 
 `Kiro` is the name shown in the CLIProxyAPI interface. The provider ID stays `kiro`; the plugin ID, library filename, and `plugins.configs` key are `kiro-ha` (see [Build](#build)).
 
 ## Requirements
 
-- CLIProxyAPI 7.2.151 (plugin SDK v7.2.151, RPC schema 5)
-- Windows amd64, Linux amd64, or Linux arm64
+- CLIProxyAPI 7.2.151 or later (built against plugin SDK v7.2.151, RPC schema 5; runs in production on 8.0.2)
+- Windows amd64, Linux amd64, Linux arm64, macOS amd64, or macOS arm64
 - Go 1.26
 - A C compiler available to CGO
 - A Kiro account connected through one of the supported methods
@@ -32,14 +32,14 @@ The plugin:
 go test ./...
 go vet ./...
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
-  -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=0.9.1" \
+  -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=<version>" \
   -o package/kiro-ha.so ./cmd/kiro-plugin
 sha256sum package/kiro-ha.so > package/kiro-ha.so.sha256
 ```
 
-On Windows use the same flags with `-o package/kiro-ha.dll`. The two `-ldflags -X` values are what the release workflow pins: `clientVersion` is the Kiro CLI release the plugin identifies as, and `pluginVersion` is reported to CPA as the plugin version (it defaults to `dev` when omitted).
+On Windows use the same flags with `-o package/kiro-ha.dll`, on macOS `-o package/kiro-ha.dylib`. The two `-ldflags -X` values are what the release workflow pins: `clientVersion` is the Kiro CLI release the plugin identifies as, and `pluginVersion` is reported to CPA as the plugin version (it defaults to `dev` when omitted).
 
-The GitHub Actions workflow tests Windows and Linux, then publishes archives for Windows amd64, Linux amd64, and Linux arm64 on every `v*` tag. Each archive and plugin binary has a SHA-256 checksum. Linux packages contain `kiro-ha.so`; Windows packages contain `kiro-ha.dll`.
+The GitHub Actions workflow tests Windows, Linux and macOS, then publishes archives for Windows amd64, Linux amd64, Linux arm64, macOS amd64 and macOS arm64 on every `v*` tag. Each archive and plugin binary has a SHA-256 checksum. Linux packages contain `kiro-ha.so`, Windows packages `kiro-ha.dll`, and macOS packages `kiro-ha.dylib`.
 
 The library is named `kiro-ha` because CLIProxyAPI derives the plugin ID from the file name and the official plugin store already publishes a plugin with ID `kiro`. Keeping a distinct ID means a store install of that plugin cannot overwrite this binary. The provider name stays `kiro`, so credential files, `oauth-model-alias` and `oauth-excluded-models` entries are unchanged.
 
@@ -86,13 +86,12 @@ CLIProxyAPI serves plugin resource routes without the management key, so the pag
 | --- | --- | --- |
 | `GET /v0/resource/plugins/kiro-ha/usage` | none | Static shell: layout and one script, identical bytes on every request, no account data. |
 | `GET /v0/management/plugins/kiro/usage/view?lang=&refresh=` | management key | The account table as an HTML fragment. `refresh` names one credential file or `all`. |
-| `POST /v0/management/plugins/kiro/usage/credential` | management key | Body `{"file": "<credential file>", "disabled": true\|false}`; sets only that credential's `disabled` flag. |
 
 The Usage and sign-in pages are available in English, Vietnamese and Simplified Chinese, following the Management Center's language.
 
 The shell reads the key the Management Center keeps when it signs in with “Remember password” ticked; otherwise it asks for the key and holds it in memory only. Its Content-Security-Policy admits only its own script by hash and allows network requests to the same origin only, so the injected fragment cannot run code. Results remain in memory for 60 seconds, and a manual reload is limited to one upstream call per account every 10 seconds.
 
-The page never writes quota data and changes nothing but the `disabled` flag of a credential you toggle. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
+The page is read-only: it never writes quota data or credential settings. To disable or enable a credential, use the Auth Files page of the Management Center. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
 
 ## Architecture
 

@@ -78,10 +78,12 @@ type KiroTokenData struct {
 	Scopes string `json:"scopes,omitempty"`
 	// Host-owned routing/settings fields are kept in the credential document so
 	// plugin refresh/model-discovery updates cannot silently erase CPA UI state.
+	// DisableCooling is a pointer so an explicit false survives: CPA treats a
+	// credential-level false as an override of the provider and global setting.
 	Priority          int    `json:"priority,omitempty"`
 	Weight            int    `json:"weight,omitempty"`
 	Disabled          bool   `json:"disabled,omitempty"`
-	DisableCooling    bool   `json:"disable_cooling,omitempty"`
+	DisableCooling    *bool  `json:"disable_cooling,omitempty"`
 	RequestRetry      int    `json:"request_retry,omitempty"`
 	PreferredEndpoint string `json:"preferred_endpoint,omitempty"`
 	// ModelCatalog is the credential's last model listing, persisted so model

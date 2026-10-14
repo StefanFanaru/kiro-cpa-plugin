@@ -406,8 +406,9 @@ func carryHostOwnedFields(from *kiroauth.KiroTokenData, to *kiroauth.KiroTokenDa
 	if !to.Disabled {
 		to.Disabled = from.Disabled
 	}
-	if !to.DisableCooling {
-		to.DisableCooling = from.DisableCooling
+	if to.DisableCooling == nil && from.DisableCooling != nil {
+		value := *from.DisableCooling
+		to.DisableCooling = &value
 	}
 	if to.RequestRetry == 0 {
 		to.RequestRetry = from.RequestRetry

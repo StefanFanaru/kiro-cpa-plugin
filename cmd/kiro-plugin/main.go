@@ -997,8 +997,8 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	if token.Disabled {
 		metadata["disabled"] = true
 	}
-	if token.DisableCooling {
-		metadata["disable_cooling"] = true
+	if token.DisableCooling != nil {
+		metadata["disable_cooling"] = *token.DisableCooling
 	}
 	return metadata
 }
@@ -1359,7 +1359,7 @@ func applyHostOwnedSettings(token *kiroauth.KiroTokenData, metadata map[string]a
 			token.Disabled = value
 		}
 		if value, ok := metadata["disable_cooling"].(bool); ok {
-			token.DisableCooling = value
+			token.DisableCooling = &value
 		}
 	}
 	if attrs == nil {

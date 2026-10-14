@@ -634,12 +634,28 @@ func admitCredential(ctx context.Context, auth *cliproxyauth.Auth, tokenKey stri
 	limiter := kiroauth.GetGlobalRateLimiter()
 	if reason, retryAfter, unavailable := limiter.TokenUnavailable(tokenKey); unavailable {
 		log.Warnf("kiro: token %s is out of rotation for %v (%s)", tokenKey, retryAfter, reason)
-		return statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", retryAfter, reason), retryAfter: &retryAfter}
+		return statusErr{code: unavailableStatus(reason), msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", retryAfter, reason), retryAfter: &retryAfter}
 	}
 	if err := limiter.WaitForToken(ctx, tokenKey); err != nil {
 		return statusErr{code: 499, msg: "client canceled request"}
 	}
 	return nil
+}
+
+// unavailableStatus picks the status a locally parked credential is refused
+// with. CPA cannot read the plugin's retry-after (pluginabi.Error has no field
+// for it), so the status alone decides the host's cooldown: 429 starts a
+// ladder at one second, while 402 and 403 cool the credential for 30 minutes
+// and still fail over to the next credential (checked on CPA 7.2.151, 7.3.7
+// and 8.0.2: clienterror.IsRequestFault, conductor_cooldown "case 401, 402, 403").
+func unavailableStatus(reason string) int {
+	switch reason {
+	case kiroauth.ReasonMonthlyLimit:
+		return http.StatusPaymentRequired
+	case kiroauth.ReasonSuspended:
+		return http.StatusForbidden
+	}
+	return http.StatusTooManyRequests
 }
 
 // markUnavailable records an upstream condition the plugin must remember
@@ -893,8 +909,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			return resp, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
-		// Handle 402 errors - Monthly Limit Reached. CPA needs a 429 to
-		// rotate away from this credential.
+		// Handle 402 errors - Monthly Limit Reached. Returned as 402: CPA fails
+		// over on it and cools the credential for 30 minutes, where a 429
+		// would bring it back within seconds (see unavailableStatus).
 		if httpResp.StatusCode == 402 {
 			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
@@ -903,8 +920,8 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			log.Warnf("kiro: received 402 (monthly limit). Upstream body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 			remaining := kiroauth.UntilNextUTCDay()
-			markUnavailable(auth, tokenKey, "monthly limit reached", remaining)
-			return resp, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
+			markUnavailable(auth, tokenKey, kiroauth.ReasonMonthlyLimit, remaining)
+			return resp, statusErr{code: http.StatusPaymentRequired, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
 		}
 
 		// Handle 403 errors - Access Denied / Token Expired
@@ -1155,8 +1172,8 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			log.Warnf("kiro: stream received 402 (monthly limit). Upstream body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 			remaining := kiroauth.UntilNextUTCDay()
-			markUnavailable(auth, tokenKey, "monthly limit reached", remaining)
-			return nil, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
+			markUnavailable(auth, tokenKey, kiroauth.ReasonMonthlyLimit, remaining)
+			return nil, statusErr{code: http.StatusPaymentRequired, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
 		}
 
 		// Handle 403 errors - Access Denied / Token Expired

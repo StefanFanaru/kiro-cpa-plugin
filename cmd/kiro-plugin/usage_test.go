@@ -542,7 +542,7 @@ func TestDesktopRefreshPreservesHostOwnedFields(t *testing.T) {
 	if refreshed.Email != "owner@example.test" {
 		t.Fatalf("display identity was lost: %q", refreshed.Email)
 	}
-	if refreshed.Priority != 7 || refreshed.Weight != 3 || !refreshed.Disabled || !refreshed.DisableCooling || refreshed.RequestRetry != 2 {
+	if refreshed.Priority != 7 || refreshed.Weight != 3 || !refreshed.Disabled || !boolSet(refreshed.DisableCooling, true) || refreshed.RequestRetry != 2 {
 		t.Fatalf("host-owned routing fields were lost: %+v", refreshed)
 	}
 	if refreshed.PreferredEndpoint != "https://alt.example.test" {
@@ -574,7 +574,7 @@ func TestCarryHostOwnedFieldsRestoresARebuiltCredential(t *testing.T) {
 	if rebuilt.Email != "idc@example.test" || rebuilt.Priority != 5 || rebuilt.Weight != 2 {
 		t.Fatalf("carry dropped identity or routing: %+v", rebuilt)
 	}
-	if !rebuilt.Disabled || !rebuilt.DisableCooling || rebuilt.RequestRetry != 4 || rebuilt.PreferredEndpoint != "https://idc.example.test" {
+	if !rebuilt.Disabled || !boolSet(rebuilt.DisableCooling, true) || rebuilt.RequestRetry != 4 || rebuilt.PreferredEndpoint != "https://idc.example.test" {
 		t.Fatalf("carry dropped host settings: %+v", rebuilt)
 	}
 	encoded, err := json.Marshal(rebuilt)
@@ -583,6 +583,55 @@ func TestCarryHostOwnedFieldsRestoresARebuiltCredential(t *testing.T) {
 	}
 	if !strings.Contains(string(encoded), `"note":"idc note"`) {
 		t.Fatalf("carry dropped unknown host keys: %s", encoded)
+	}
+}
+
+// An OIDC refresh returns token material only, so the rebuilt credential has
+// none of the fields AWS reported earlier. The display label is derived from
+// those fields, and losing them on every refresh turned 35 distinct Builder ID
+// cards into the same "Kiro Builder ID" on the Auth Files page.
+func TestCarryHostOwnedFieldsKeepsTheIdentityTheLabelIsBuiltFrom(t *testing.T) {
+	stored, err := decodeToken([]byte(`{"type":"kiro","authMethod":"builder-id","accessToken":"stored-access","awsUserId":"d-9067642ac7.abcd1234-1111-2222-3333-444455556666","identity":"kiro-builder-id-d-9067642ac7-abcd1234","profileName":"team-profile","subscriptionTitle":"KIRO STUDENT"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt := &kiroauth.KiroTokenData{AccessToken: "new", RefreshToken: "new-refresh", AuthMethod: "builder-id"}
+	carryHostOwnedFields(stored, rebuilt)
+	if rebuilt.AWSUserID != stored.AWSUserID || rebuilt.Identity != stored.Identity ||
+		rebuilt.ProfileName != stored.ProfileName || rebuilt.SubscriptionTitle != stored.SubscriptionTitle {
+		t.Fatalf("carry dropped AWS-reported identity: %+v", rebuilt)
+	}
+	if got, want := identityLabel(rebuilt), identityLabel(stored); got != want {
+		t.Fatalf("label after refresh = %q, want %q", got, want)
+	}
+	// A value the refresh did return wins over the stored one.
+	renamed := &kiroauth.KiroTokenData{AccessToken: "new", AuthMethod: "builder-id", SubscriptionTitle: "KIRO PRO"}
+	carryHostOwnedFields(stored, renamed)
+	if renamed.SubscriptionTitle != "KIRO PRO" {
+		t.Fatalf("carry overwrote a value the refresh returned: %q", renamed.SubscriptionTitle)
+	}
+}
+
+// The snake_case spelling is the only one 35 live credentials carry. CPA writes
+// the file from Metadata laid over StorageJSON (pluginhost mergedStorageJSON),
+// so the label a refresh publishes in Metadata is the one that lands on disk.
+func TestRefreshedAuthDataPublishesTheDerivedLabel(t *testing.T) {
+	raw := []byte(`{"type":"kiro","authMethod":"builder-id","accessToken":"a","refreshToken":"r","clientId":"c","clientSecret":"s","region":"us-east-1","startUrl":"https://view.awsapps.com/start","aws_user_id":"d-9067642ac7.abcd1234-1111-2222-3333-444455556666","email":"Kiro Builder ID","display_name":"Kiro Builder ID"}`)
+	stored, err := decodeToken(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	applyHostOwnedSettings(stored, document, nil)
+	rebuilt := &kiroauth.KiroTokenData{AccessToken: "new", RefreshToken: "new-r", ClientID: "c", ClientSecret: "s", Region: "us-east-1", StartURL: stored.StartURL, AuthMethod: "builder-id"}
+	carryHostOwnedFields(stored, rebuilt)
+	data := authData(rebuilt, "kiro-builder-id-d-9067642ac7-abcd1234.json")
+	const want = "Builder ID · abcd1234"
+	if data.Label != want || data.Metadata["email"] != want || data.Metadata["display_name"] != want {
+		t.Fatalf("label = %q, metadata email = %v, display_name = %v; want %q", data.Label, data.Metadata["email"], data.Metadata["display_name"], want)
 	}
 }
 
@@ -1855,5 +1904,52 @@ func TestUsagePageHighlightsTheWholeAccountNotOneRow(t *testing.T) {
 	// reports the same expanded state.
 	if strings.Count(html, `data-target="kiro-detail-0"`) != 2 {
 		t.Fatalf("every pool row of an account must share one detail target: %s", html)
+	}
+}
+
+func boolSet(value *bool, want bool) bool {
+	return value != nil && *value == want
+}
+
+func TestDisableCoolingKeepsExplicitFalse(t *testing.T) {
+	stored, err := decodeToken([]byte(`{"type":"kiro","authMethod":"idc","accessToken":"a","email":"idc@example.test","disable_cooling":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !boolSet(stored.DisableCooling, false) {
+		t.Fatalf("explicit false was not decoded: %v", stored.DisableCooling)
+	}
+	if value, ok := authMetadata(stored)["disable_cooling"].(bool); !ok || value {
+		t.Fatalf("explicit false was not published: %#v", authMetadata(stored)["disable_cooling"])
+	}
+
+	refreshed := &kiroauth.KiroTokenData{AccessToken: "b"}
+	carryHostOwnedFields(stored, refreshed)
+	if !boolSet(refreshed.DisableCooling, false) {
+		t.Fatalf("explicit false was lost across a refresh: %v", refreshed.DisableCooling)
+	}
+	*stored.DisableCooling = true
+	if !boolSet(refreshed.DisableCooling, false) {
+		t.Fatal("refreshed credential shares the stored pointer")
+	}
+
+	applyHostOwnedSettings(refreshed, map[string]any{"disable_cooling": true}, nil)
+	if !boolSet(refreshed.DisableCooling, true) {
+		t.Fatalf("host metadata did not override: %v", refreshed.DisableCooling)
+	}
+
+	for _, raw := range []string{
+		`{"type":"kiro","authMethod":"idc","accessToken":"a","email":"idc@example.test"}`,
+		`{"type":"kiro","authMethod":"idc","accessToken":"a","email":"idc@example.test","disable_cooling":null}`,
+	} {
+		absent, err := decodeToken([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A stored null is passed through as null, which CPA reads as "no
+		// override" (parseBoolAny rejects it); only a boolean may be published.
+		if _, isBool := authMetadata(absent)["disable_cooling"].(bool); isBool || absent.DisableCooling != nil {
+			t.Fatalf("absent or null disable_cooling was published as a value for %s", raw)
+		}
 	}
 }

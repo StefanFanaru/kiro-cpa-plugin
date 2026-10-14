@@ -27,9 +27,8 @@ import (
 // The usage page is a static shell on a resource route plus two Management API
 // routes that carry everything account-specific.
 const (
-	usageResourcePath    = "/usage"
-	usageViewRoute       = "/plugins/kiro/usage/view"
-	usageCredentialRoute = "/plugins/kiro/usage/credential"
+	usageResourcePath = "/usage"
+	usageViewRoute    = "/plugins/kiro/usage/view"
 )
 
 const (
@@ -380,6 +379,21 @@ func carryHostOwnedFields(from *kiroauth.KiroTokenData, to *kiroauth.KiroTokenDa
 	if to.Email == "" {
 		to.Email = from.Email
 	}
+	// The display label is derived from these. An OIDC refresh returns token
+	// material only, so without them every refresh rewrote a Builder ID card as
+	// the bare "Kiro Builder ID".
+	if to.AWSUserID == "" {
+		to.AWSUserID = from.AWSUserID
+	}
+	if to.Identity == "" {
+		to.Identity = from.Identity
+	}
+	if to.ProfileName == "" {
+		to.ProfileName = from.ProfileName
+	}
+	if to.SubscriptionTitle == "" {
+		to.SubscriptionTitle = from.SubscriptionTitle
+	}
 	if to.Provider == "" {
 		to.Provider = from.Provider
 	}
@@ -392,8 +406,9 @@ func carryHostOwnedFields(from *kiroauth.KiroTokenData, to *kiroauth.KiroTokenDa
 	if !to.Disabled {
 		to.Disabled = from.Disabled
 	}
-	if !to.DisableCooling {
-		to.DisableCooling = from.DisableCooling
+	if to.DisableCooling == nil && from.DisableCooling != nil {
+		value := *from.DisableCooling
+		to.DisableCooling = &value
 	}
 	if to.RequestRetry == 0 {
 		to.RequestRetry = from.RequestRetry
@@ -879,74 +894,6 @@ func credentialNote(raw []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(document.Note)
-}
-
-// usageCredentialRequest is the body of the enable/disable call.
-type usageCredentialRequest struct {
-	File     string `json:"file"`
-	Disabled *bool  `json:"disabled"`
-}
-
-// handleUsageCredential enables or disables one Kiro credential. It only sets
-// the credential's disabled flag through the host, which CPA then applies.
-func handleUsageCredential(req pluginapi.ManagementRequest) ([]byte, error) {
-	if req.Method != http.MethodPost {
-		return usageCredentialResponse(http.StatusMethodNotAllowed, map[string]any{"error": "use POST"})
-	}
-	var body usageCredentialRequest
-	if err := json.Unmarshal(req.Body, &body); err != nil || body.Disabled == nil {
-		return usageCredentialResponse(http.StatusBadRequest, map[string]any{"error": "expected {\"file\": string, \"disabled\": bool}"})
-	}
-	name := filepath.Base(strings.TrimSpace(body.File))
-	if name == "." || name == "" || name == string(filepath.Separator) {
-		return usageCredentialResponse(http.StatusBadRequest, map[string]any{"error": "file is required"})
-	}
-	if err := setCredentialDisabled(name, *body.Disabled); err != nil {
-		return usageCredentialResponse(http.StatusBadGateway, map[string]any{"error": err.Error()})
-	}
-	clearUsageCache()
-	return usageCredentialResponse(http.StatusOK, map[string]any{"file": name, "disabled": *body.Disabled})
-}
-
-func usageCredentialResponse(status int, payload map[string]any) ([]byte, error) {
-	body, _ := json.Marshal(payload)
-	return okEnvelope(pluginapi.ManagementResponse{
-		StatusCode: status,
-		Headers:    http.Header{"Cache-Control": []string{"no-store"}, "Content-Type": []string{"application/json"}},
-		Body:       body,
-	})
-}
-
-// setCredentialDisabled flips the disabled flag of the Kiro credential stored
-// under name and saves the document back through the host, leaving every other
-// field as it was.
-func setCredentialDisabled(name string, disabled bool) error {
-	var listed hostAuthListResponse
-	if err := callHostResult(pluginabi.MethodHostAuthList, nil, &listed); err != nil {
-		return fmt.Errorf("list Kiro credentials: %w", err)
-	}
-	for _, entry := range listed.Files {
-		if filepath.Base(entry.Name) != name || !(strings.EqualFold(entry.Provider, providerName) || strings.EqualFold(entry.Type, providerName)) {
-			continue
-		}
-		record, _, _, err := getHostKiroAuth(entry.AuthIndex)
-		if err != nil && len(record.JSON) == 0 {
-			return fmt.Errorf("read Kiro credential %s: %w", name, err)
-		}
-		var document map[string]any
-		if err := json.Unmarshal(record.JSON, &document); err != nil {
-			return fmt.Errorf("decode Kiro credential %s: %w", name, err)
-		}
-		document["disabled"] = disabled
-		saved, _ := json.Marshal(document)
-		request, _ := json.Marshal(pluginapi.HostAuthSaveRequest{Name: name, JSON: saved})
-		var response pluginapi.HostAuthSaveResponse
-		if err := callHostResult(pluginabi.MethodHostAuthSave, request, &response); err != nil {
-			return fmt.Errorf("save Kiro credential %s: %w", name, err)
-		}
-		return nil
-	}
-	return fmt.Errorf("credential %s not found", name)
 }
 
 func getHostKiroAuth(authIndex string) (pluginapi.HostAuthGetResponse, []byte, *kiroauth.KiroTokenData, error) {

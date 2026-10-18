@@ -21,6 +21,12 @@ func ClientVersion() string {
 	return version
 }
 
+// DesktopAuthUserAgent is the User-Agent kiro-cli sends to the Kiro desktop
+// auth service (prod.us-east-1.auth.desktop.kiro.dev). Without it Go sends
+// "Go-http-client/1.1". Reference: kirodotdev/KiroCrew,
+// src/kiro_crew/auth/login/endpoints.py (USER_AGENT).
+const DesktopAuthUserAgent = "Kiro-CLI"
+
 // ClientUserAgent identifies the plugin as a Kiro CLI-compatible client. It
 // reports the real build platform and does not create a synthetic device ID.
 func ClientUserAgent() string {

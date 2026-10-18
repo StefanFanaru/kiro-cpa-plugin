@@ -48,6 +48,7 @@ func (c *SSOOIDCClient) RefreshDesktopToken(ctx context.Context, refreshToken, r
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", DesktopAuthUserAgent)
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return nil, OIDCStatusError{Status: http.StatusBadGateway, Message: "refresh Kiro desktop token: " + err.Error()}

@@ -16,6 +16,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Kiro CLI release the plugin identifies as (User-Agent and appVersion).
+  # Latest is published at desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json.
+  KIRO_CLIENT_VERSION: "2.32.0"
+
 jobs:
   test:
     strategy:
@@ -114,13 +119,13 @@ jobs:
           $env:CGO_ENABLED = '1'
           $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG.TrimStart('v') } else { "dev-$((git rev-parse HEAD).Substring(0,7))" }
           go build -trimpath -buildmode=c-shared `
-            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" `
+            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=$env:KIRO_CLIENT_VERSION -X main.pluginVersion=$version" `
             -o package/kiro-ha.dll ./cmd/kiro-plugin
           # The linker drops an -X that names a missing symbol without an error.
           # Both defaults ("dev") differ from the stamped values, so a missing
           # string means the stamp never applied.
           $stamped = [System.IO.File]::ReadAllText('package/kiro-ha.dll', [System.Text.Encoding]::ASCII)
-          foreach ($needle in @($version, '2.19.0')) {
+          foreach ($needle in @($version, $env:KIRO_CLIENT_VERSION)) {
             if (-not $stamped.Contains($needle)) { throw "kiro-ha.dll is missing stamped version $needle" }
           }
           $hash = (Get-FileHash -Algorithm SHA256 package/kiro-ha.dll).Hash.ToLowerInvariant()
@@ -185,13 +190,13 @@ jobs:
           version="dev-$(git rev-parse --short=7 HEAD)"
           if [[ -n "$RELEASE_TAG" ]]; then version="${RELEASE_TAG#v}"; fi
           go build -trimpath -buildmode=c-shared \
-            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" \
+            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=$KIRO_CLIENT_VERSION -X main.pluginVersion=$version" \
             -o package/kiro-ha.so ./cmd/kiro-plugin
           strings package/kiro-ha.so | grep -Fq "$version"
           # The linker drops an -X that names a missing symbol without an error.
-          # This catches it because the source default is "dev", not 2.19.0, so
+          # This catches it because the source default is "dev", not the stamped version, so
           # the string is only present when the stamp actually applied.
-          strings package/kiro-ha.so | grep -Fq '2.19.0'
+          strings package/kiro-ha.so | grep -Fq "$KIRO_CLIENT_VERSION"
           nm -D package/kiro-ha.so | grep -Fq 'cliproxy_plugin_init'
           sha256sum package/kiro-ha.so | sed 's#package/##' > package/kiro-ha.so.sha256
           tar -C package -czf "kiro-ha-linux-${GOARCH}.tar.gz" kiro-ha.so kiro-ha.h kiro-ha.so.sha256
@@ -254,12 +259,12 @@ jobs:
           version="dev-$(git rev-parse --short=7 HEAD)"
           if [[ -n "$RELEASE_TAG" ]]; then version="${RELEASE_TAG#v}"; fi
           go build -trimpath -buildmode=c-shared \
-            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" \
+            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=$KIRO_CLIENT_VERSION -X main.pluginVersion=$version" \
             -o package/kiro-ha.dylib ./cmd/kiro-plugin
           # The linker drops an -X that names a missing symbol without an error;
           # both source defaults are "dev", so the strings prove the stamps.
           grep -aFq "$version" package/kiro-ha.dylib
-          grep -aFq '2.19.0' package/kiro-ha.dylib
+          grep -aFq "$KIRO_CLIENT_VERSION" package/kiro-ha.dylib
           nm -gU package/kiro-ha.dylib | grep -Fq 'cliproxy_plugin_init'
           [[ "$(lipo -archs package/kiro-ha.dylib)" == "$CLANG_ARCH" ]]
           (cd package && shasum -a 256 kiro-ha.dylib > kiro-ha.dylib.sha256)

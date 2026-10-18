@@ -35,7 +35,7 @@ func TestRefreshDesktopTokenUsesFixedEndpointAndFillsGaps(t *testing.T) {
 	if captured.URL.String() != desktopRefreshEndpoint || captured.Method != http.MethodPost {
 		t.Fatalf("request = %s %s", captured.Method, captured.URL)
 	}
-	if captured.Header.Get("Content-Type") != "application/json" || captured.Header.Get("Accept") != "application/json" {
+	if captured.Header.Get("Content-Type") != "application/json" || captured.Header.Get("Accept") != "application/json" || captured.Header.Get("User-Agent") != "Kiro-CLI" {
 		t.Fatalf("headers = %v", captured.Header)
 	}
 	body, _ := io.ReadAll(captured.Body)

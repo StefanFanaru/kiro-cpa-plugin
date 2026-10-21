@@ -20,7 +20,7 @@ The plugin:
 
 ## Requirements
 
-- CLIProxyAPI 7.2.151 or later (built against plugin SDK v7.2.151, RPC schema 5; runs in production on 8.0.2)
+- CLIProxyAPI 7.2.151 or later (built against plugin SDK v7.2.151, RPC schema 5; runs in production on 8.0.29)
 - Windows amd64, Linux amd64, Linux arm64, macOS amd64, or macOS arm64
 - Go 1.26
 - A C compiler available to CGO
@@ -57,18 +57,41 @@ plugins:
       priority: 1
 ```
 
-Restart CLIProxyAPI and open the OAuth page in the Management Center. Every sign-in method is stored as a standard CPA Authentication File; API keys are deliberately not stored in `config.yaml`.
+Restart CLIProxyAPI. Every sign-in method is stored as a standard CPA Authentication File; API keys are deliberately not stored in `config.yaml`.
 
-- **Stock Management Center.** Press `Start Kiro Login`, then `Open Link`. The link opens the plugin's sign-in page (`/v0/resource/plugins/kiro-ha/login`) in a new tab. Choose a method there; the Kiro card on the OAuth page finishes on its own. Nothing needs to be pasted into the card's Callback URL field.
-- **Vietnamese Management Center fork.** Expand the Kiro card and choose a method inline.
+### Sign in
 
-Both paths submit the method to the same authenticated `POST /v0/management/plugins/kiro/connect` route, so API keys, refresh tokens and imported JSON only travel through CPA's Management API. The sign-in page is a static shell like the Usage page: it reads the key the Management Center keeps when it signs in with “Remember password” ticked, or asks for it and holds it in memory only. The sign-in state that `StartLogin` issues travels in the URL fragment, which the browser never sends to the server. The page must be served from the same origin as the Management Center, which is the case when CPA serves `management.html` itself.
+Open the OAuth page of the Management Center, press `Start Kiro Login`, then `Open Link`. The link opens the plugin's sign-in page (`/v0/resource/plugins/kiro-ha/login`) in a new tab. Choose a method there; the Kiro card on the OAuth page finishes on its own. Nothing needs to be pasted into the card's Callback URL field.
 
-Builder ID and IAM Identity Center use Kiro CLI's remote device flow, so they also work in containers and on hosts without a browser. The sign-in page or the fork's Kiro card displays only the real AWS verification URL and device code. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
+The page submits the method to the authenticated `POST /v0/management/plugins/kiro/connect` route, so API keys, refresh tokens and imported JSON only travel through CPA's Management API. The sign-in page is a static shell like the Usage page: it reads the key the Management Center keeps when it signs in with “Remember password” ticked, or asks for it and holds it in memory only. The sign-in state that `StartLogin` issues travels in the URL fragment, which the browser never sends to the server.
+
+Builder ID and IAM Identity Center use Kiro CLI's remote device flow, so they also work in containers and on hosts without a browser. The sign-in page displays only the real AWS verification URL and device code. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
+
+### Clients
+
+The sign-in link is relative by default. CPA gives the plugin only its own loopback callback address, so the plugin cannot know the address a browser uses to reach CPA; the Management Center resolves the relative link against its own origin, which is the CPA that serves the page.
+
+| Client | Setup |
+| --- | --- |
+| Official Management Center, served by CPA | None. |
+| EasyCLIProxyAPI | Set `login_base_url`, then enter the management key on the sign-in page. |
+
+EasyCLIProxyAPI accepts only an absolute sign-in link and rejects the relative one as invalid (登录链接无效). It opens the link in the system browser, so set `login_base_url` to the address at which that browser reaches CPA. For the CPA EasyCLIProxyAPI runs on the same machine, that is `http://127.0.0.1:<port>`:
+
+```yaml
+plugins:
+  configs:
+    kiro-ha:
+      login_base_url: http://127.0.0.1:8317
+```
+
+Give the scheme and host only. A value with a path, query, fragment or user name is ignored with a warning in the CPA log, and the link stays relative. A CPA on another host needs the address the browser opens it at, for example `https://cpa.example.com`; `127.0.0.1` reaches only the machine the browser runs on. CPA applies the setting when it reloads its configuration, without a restart. To make the link relative again, remove the key and restart CPA.
+
+The page opens outside EasyCLIProxyAPI, so it asks for the management key; EasyCLIProxyAPI shows the key in its settings under 管理密钥. EasyCLIProxyAPI's quota view covers only its built-in providers and shows no Kiro usage; open the [Kiro Usage](#kiro-usage) page for that.
 
 The plugin stores credentials through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
 
-CPA owns credential selection, failover and the 429 backoff ladder; the plugin returns status-aware errors (429/402/403/401) and forwards an upstream `Retry-After` when Kiro sends one. The plugin keeps only the protection CPA cannot provide: it paces requests per credential (`min_token_interval`/`max_token_interval`, default 1–2s with jitter), remembers a 402 monthly limit until the next UTC day, and takes a credential Kiro reports as suspended out of rotation for `suspend_cooldown` (default 1h). While a credential is parked it is refused with 402 (monthly limit) or 403 (suspended) rather than 429: CPA cannot read the plugin's retry-after, and those statuses make it fail over and cool the credential for 30 minutes instead of retrying it within seconds. These settings live under `plugins.configs.kiro-ha`; a credential with `disable_cooling: true` opts out of all of them.
+CPA owns credential selection, failover and the 429 backoff ladder; the plugin returns status-aware errors (429/402/403/401) and forwards an upstream `Retry-After` when Kiro sends one. The plugin keeps only the protection CPA cannot provide: it paces requests per credential (`min_token_interval`/`max_token_interval`, default 1–2s with jitter), remembers a 402 monthly limit until the next UTC day, and takes a credential Kiro reports as suspended out of rotation for `suspend_cooldown` (default 1h). While a credential is parked it is refused with 402 (monthly limit) or 403 (suspended) rather than 429: CPA cannot read the plugin's retry-after, and those statuses make it fail over and cool the credential for 30 minutes instead of retrying it within seconds. These settings, like `login_base_url`, live under `plugins.configs.kiro-ha`; a credential with `disable_cooling: true` opts out of all of them.
 
 ## Model capabilities
 

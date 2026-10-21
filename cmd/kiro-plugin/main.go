@@ -56,6 +56,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -403,8 +404,21 @@ func configurePlugin(raw []byte) {
 			}
 		}
 	}
+	if _, ok := normalizeLoginBaseURL(next.LoginBaseURL); !ok {
+		log.Printf("kiro: ignoring login_base_url %q: it must be an http or https origin such as http://127.0.0.1:8317", next.LoginBaseURL)
+	}
 	pluginSettings = next.normalized()
+	loginBaseURL.Store(pluginSettings.LoginBaseURL)
 	kiroauth.ConfigureGlobalRateLimiter(pluginSettings.rateLimiterConfig())
+}
+
+// loginBaseURL holds the normalized login_base_url apart from pluginSettings,
+// because handleLoginStart reads it while a reconfigure may be writing.
+var loginBaseURL atomic.Value
+
+func currentLoginBaseURL() string {
+	base, _ := loginBaseURL.Load().(string)
+	return base
 }
 
 // mergePluginSettings overlays only the fields the host actually set, treating
@@ -420,6 +434,9 @@ func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
 	}
 	if update.SuspendCooldown != "" {
 		base.SuspendCooldown = update.SuspendCooldown
+	}
+	if update.LoginBaseURL != "" {
+		base.LoginBaseURL = update.LoginBaseURL
 	}
 	return base
 }
@@ -481,7 +498,7 @@ func handleLoginStart(raw []byte) ([]byte, error) {
 	cleanupLoginFlowsLocked(time.Now().UTC())
 	loginFlows[state] = loginFlow{ExpiresAt: expiresAt}
 	loginFlowsMu.Unlock()
-	return okEnvelope(pluginapi.AuthLoginStartResponse{Provider: providerName, URL: loginURL(state), State: state, ExpiresAt: expiresAt})
+	return okEnvelope(pluginapi.AuthLoginStartResponse{Provider: providerName, URL: loginURL(currentLoginBaseURL(), state), State: state, ExpiresAt: expiresAt})
 }
 
 func handleLoginPoll(raw []byte) ([]byte, error) {

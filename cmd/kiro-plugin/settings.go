@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/url"
+	"strings"
 	"time"
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
@@ -11,10 +13,11 @@ type pluginSettingsData struct {
 	MinTokenInterval string `yaml:"min_token_interval"`
 	MaxTokenInterval string `yaml:"max_token_interval"`
 	SuspendCooldown  string `yaml:"suspend_cooldown"`
+	LoginBaseURL     string `yaml:"login_base_url"`
 }
 
 func (s pluginSettingsData) isZero() bool {
-	return s.MinTokenInterval == "" && s.MaxTokenInterval == "" && s.SuspendCooldown == ""
+	return s.MinTokenInterval == "" && s.MaxTokenInterval == "" && s.SuspendCooldown == "" && s.LoginBaseURL == ""
 }
 
 func defaultPluginSettings() pluginSettingsData {
@@ -40,7 +43,25 @@ func (s pluginSettingsData) normalized() pluginSettingsData {
 	if suspendErr != nil || suspend <= 0 {
 		s.SuspendCooldown = defaults.SuspendCooldown
 	}
+	s.LoginBaseURL, _ = normalizeLoginBaseURL(s.LoginBaseURL)
 	return s
+}
+
+// normalizeLoginBaseURL reduces a configured sign-in base to scheme and host.
+// It reports false for a value it had to drop: anything but an http(s) origin,
+// because a path, query, fragment or credentials would end up in front of the
+// page path or in a link the user copies around.
+func normalizeLoginBaseURL(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", true
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.HasSuffix(raw, "#") {
+		return "", false
+	}
+	return u.Scheme + "://" + u.Host, true
 }
 
 func (s pluginSettingsData) rateLimiterConfig() kiroauth.RateLimiterConfig {
@@ -60,5 +81,6 @@ func pluginConfigFields() []pluginapi.ConfigField {
 		{Name: "min_token_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum delay between requests for one credential. Default: 1s."},
 		{Name: "max_token_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum jittered delay between requests for one credential. Default: 2s."},
 		{Name: "suspend_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "How long a credential stays out of rotation after Kiro reports it suspended. Default: 1h."},
+		{Name: "login_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "Scheme and host the sign-in link starts with, for clients that open it outside this CPA's Management Center (EasyCLIProxyAPI: http://127.0.0.1:<port>). Default: empty, a link relative to the Management Center."},
 	}
 }

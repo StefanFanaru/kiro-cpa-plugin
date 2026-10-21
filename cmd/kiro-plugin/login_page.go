@@ -13,11 +13,14 @@ const loginResourcePath = "/login"
 
 var loginShell = newShellPage("Kiro sign-in", loginShellCSS, shellScript(loginShellText, loginShellLogic), loginShellBody)
 
-// loginURL is relative: CPA hands StartLogin only its loopback callback base,
-// and the Management Center opens the link from its own origin, which is the
-// CPA that serves this page.
-func loginURL(state string) string {
-	return resourceBasePath + loginResourcePath + "#state=" + state
+// loginURL is relative unless login_base_url is set. CPA hands StartLogin only
+// its loopback callback base, and the Management Center resolves the link
+// against its own origin, which is the CPA that serves this page. A client
+// that opens the link elsewhere (EasyCLIProxyAPI parses it with new URL() and
+// hands it to the system browser) needs an absolute link, and only the
+// operator knows which address reaches this CPA from there.
+func loginURL(base, state string) string {
+	return base + resourceBasePath + loginResourcePath + "#state=" + state
 }
 
 func handleLoginShell() ([]byte, error) {

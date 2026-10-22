@@ -129,10 +129,10 @@ jobs:
             if (-not $stamped.Contains($needle)) { throw "kiro-ha.dll is missing stamped version $needle" }
           }
           $hash = (Get-FileHash -Algorithm SHA256 package/kiro-ha.dll).Hash.ToLowerInvariant()
-          "$hash  kiro-ha.dll" | Set-Content -NoNewline -Encoding ascii package/kiro-ha.dll.sha256
+          "$hash  kiro-ha.dll`n" | Set-Content -NoNewline -Encoding ascii package/kiro-ha.dll.sha256
           Compress-Archive -Path package/* -DestinationPath kiro-ha-windows-amd64.zip
           $archiveHash = (Get-FileHash -Algorithm SHA256 kiro-ha-windows-amd64.zip).Hash.ToLowerInvariant()
-          "$archiveHash  kiro-ha-windows-amd64.zip" | Set-Content -NoNewline -Encoding ascii kiro-ha-windows-amd64.zip.sha256
+          "$archiveHash  kiro-ha-windows-amd64.zip`n" | Set-Content -NoNewline -Encoding ascii kiro-ha-windows-amd64.zip.sha256
           # The plugin store looks for one exact asset name per platform and
           # reads nothing but zip, so a release also carries that name. The
           # archive above keeps its own name for manual installs.
@@ -140,7 +140,13 @@ jobs:
             $storeZip = "kiro-ha_${version}_windows_amd64.zip"
             Compress-Archive -Path package/* -DestinationPath $storeZip
             $storeHash = (Get-FileHash -Algorithm SHA256 $storeZip).Hash.ToLowerInvariant()
-            "$storeHash  $storeZip" | Set-Content -Encoding ascii "$storeZip.sha256"
+            "$storeHash  $storeZip`n" | Set-Content -NoNewline -Encoding ascii "$storeZip.sha256"
+          }
+          # Every checksum file must read like sha256sum output, one entry ending
+          # in LF, or `sha256sum -c` on Linux and macOS reports it as missing.
+          foreach ($sum in Get-ChildItem -Path package/*.sha256, *.sha256) {
+            $bytes = [System.IO.File]::ReadAllBytes($sum.FullName)
+            if ($bytes -contains 13 -or $bytes[-1] -ne 10) { throw "$($sum.Name) must end its entry with LF only" }
           }
       - name: Upload release assets
         if: env.RELEASE_TAG != ''
@@ -304,6 +310,13 @@ jobs:
           TAG: ${{ needs.prepare-release.outputs.tag }}
         run: |
           version="${TAG#v}"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir all-sums --pattern '*.sha256'
+          for sum in all-sums/*.sha256; do
+            if grep -q $'\r' "$sum" || [ -n "$(tail -c1 "$sum")" ]; then
+              echo "$sum must end its entry with LF only" >&2
+              exit 1
+            fi
+          done
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir sums --pattern 'kiro-ha_*.zip.sha256'
           # awk terminates every record it prints, so a file written without a
           # trailing newline cannot merge two entries into one unreadable line,

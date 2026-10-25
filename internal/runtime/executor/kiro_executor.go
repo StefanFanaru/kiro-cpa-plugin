@@ -2351,7 +2351,6 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			return false
 
 		case "assistantResponseEvent":
-			emitMessageStart()
 			var contentDelta string
 			var toolUses []map[string]interface{}
 
@@ -2400,6 +2399,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			// Assistant response events are text. Reasoning is emitted only from the
 			// dedicated reasoningContentEvent below; textual tags are never reinterpreted.
 			if contentDelta != "" || len(toolUses) > 0 {
+				emitMessageStart()
 				if isThinkingBlockOpen {
 					blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
 					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
@@ -2508,7 +2508,6 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			// they are never mistaken for visible text: buffering them until the
 			// signature left the client with no progress for the whole reasoning
 			// phase, and Claude Code abandons a stream that is silent for five minutes.
-			emitMessageStart()
 			var thinkingText string
 			var signature string
 			var redactedContent string
@@ -2539,6 +2538,11 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			if currentToolUse != nil && (thinkingText != "" || signature != "" || redactedContent != "") {
 				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", fmt.Sprintf("reasoning arrived during tool call %q", aliases.original(currentToolUse.Name)))}
 				return false
+			}
+			// An empty delta writes nothing, so it must not start the message: an
+			// error after it would no longer be the first chunk.
+			if thinkingText != "" || signature != "" || redactedContent != "" {
+				emitMessageStart()
 			}
 
 			if thinkingText != "" || (signature != "" && redactedContent == "") {

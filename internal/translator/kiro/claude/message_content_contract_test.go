@@ -251,3 +251,26 @@ func TestBuildKiroPayloadKeepsToolInputNumbersExact(t *testing.T) {
 		t.Fatalf("tool_use input rendering changed, want %s in:\n%s", want, raw)
 	}
 }
+
+func TestBuildKiroPayloadReplaysOnlyTheFirstSignedThinkingBlock(t *testing.T) {
+	t.Parallel()
+	payload := buildTestPayload(t, `{
+		"messages":[
+			{"role":"user","content":"go"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"unsigned","signature":""},
+				{"type":"thinking","thinking":"one","signature":"sig1"},
+				{"type":"text","text":"mid"},
+				{"type":"thinking","thinking":"two","signature":"sig2"}
+			]},
+			{"role":"user","content":"ok"}
+		]
+	}`)
+	rc := payload.ConversationState.History[1].AssistantResponseMessage.ReasoningContent
+	if rc == nil || rc.ReasoningText == nil {
+		t.Fatalf("reasoning = %#v, want first signed block", rc)
+	}
+	if rc.ReasoningText.Text != "one" || rc.ReasoningText.Signature != "sig1" {
+		t.Fatalf("reasoning = %#v, want text one with sig1", rc.ReasoningText)
+	}
+}

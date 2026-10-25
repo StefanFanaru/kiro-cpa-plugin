@@ -9,7 +9,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -62,15 +64,26 @@ func (e upstreamIdleErr) Temporary() bool { return true }
 // timeout by design, so without this an upstream that sent its headers and
 // then went quiet held the request forever. Each attempt gets its own child
 // context; closing the body releases it.
-func sendUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
-	ctx, cancel := context.WithCancelCause(req.Context())
-	resp, err := client.Do(req.WithContext(ctx))
+//
+// sent reports whether the whole request was written. A transport error after
+// that point does not mean Kiro did not receive the request, so the caller
+// must not send it again: Kiro would generate, and bill, it twice.
+func sendUpstream(client *http.Client, req *http.Request) (resp *http.Response, sent bool, err error) {
+	var written atomic.Bool
+	ctx, cancel := context.WithCancelCause(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				written.Store(true)
+			}
+		},
+	}))
+	resp, err = client.Do(req.WithContext(ctx))
 	if err != nil {
 		cancel(nil)
-		return nil, err
+		return nil, written.Load(), err
 	}
 	resp.Body = newIdleBody(ctx, cancel, resp.Body)
-	return resp, nil
+	return resp, true, nil
 }
 
 // idleBody cancels its request with upstreamIdleErr when no read returns

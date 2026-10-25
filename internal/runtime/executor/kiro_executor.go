@@ -833,7 +833,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		// No client timeout: it covers the whole body, so it would cap generation
 		// length. The caller's context and ResponseHeaderTimeout still apply.
 		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
-		httpResp, err := sendUpstream(httpClient, httpReq)
+		httpResp, sent, err := sendUpstream(httpClient, httpReq)
 		if err != nil {
 			// Check for context cancellation first - client disconnected, not a server error
 			// Use 499 (Client Closed Request - nginx convention) instead of 500
@@ -851,7 +851,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			recordAPIResponseError(ctx, e.cfg, err)
 
-			if isRetryableError(err) && attempt < maxRetries {
+			// Only a request that never left is retried: once it was written,
+			// Kiro may already be generating, and billing, the answer.
+			if !sent && isRetryableError(err) && attempt < maxRetries {
 				delay := calculateRetryDelay(attempt)
 				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("socket error: %v", err), delay, endpoint.Name)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
@@ -1096,11 +1098,13 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		})
 
 		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
-		httpResp, err := sendUpstream(httpClient, httpReq)
+		httpResp, sent, err := sendUpstream(httpClient, httpReq)
 		if err != nil {
 			recordAPIResponseError(ctx, e.cfg, err)
 
-			if isRetryableError(err) && attempt < maxRetries {
+			// Only a request that never left is retried: once it was written,
+			// Kiro may already be generating, and billing, the answer.
+			if !sent && isRetryableError(err) && attempt < maxRetries {
 				delay := calculateRetryDelay(attempt)
 				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("stream socket error: %v", err), delay, endpoint.Name)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {

@@ -177,6 +177,33 @@ func TestModelsForAuthWithoutCatalogReportsFailures(t *testing.T) {
 	}
 }
 
+// A stored catalogue answers without the credential lock, so model listing
+// never queues behind an auth.refresh or a usage fetch on the same account.
+func TestModelsForAuthStoredCatalogDoesNotWaitForCredentialLock(t *testing.T) {
+	storage := []byte(`{"type":"kiro","authMethod":"builder-id","accessToken":"a","refreshToken":"r","region":"us-east-1","clientIdHash":"lock-a5","expiresAt":"2099-01-01T00:00:00Z","kiro_model_catalog":{"fetched_at":"2026-01-01T00:00:00Z","models":[{"modelId":"claude-sonnet-4.5","modelName":"Claude Sonnet 4.5"}]}}`)
+	token, err := decodeToken(storage)
+	if err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	if _, ok := storedModelCatalog(token); !ok {
+		t.Fatalf("fixture has no stored catalogue")
+	}
+	lock := credentialUsageLock(token, "auth-a5")
+	lock.Lock() // in-flight auth.refresh
+	defer lock.Unlock()
+	raw, _ := json.Marshal(pluginapi.AuthModelRequest{AuthID: "auth-a5", StorageJSON: storage})
+	done := make(chan error, 1)
+	go func() { _, err := handleModelsForAuth(raw); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("models for auth: %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("model.for_auth blocked on the credential lock although a stored catalogue exists")
+	}
+}
+
 func refreshAuth(t *testing.T, storage []byte) pluginapi.AuthRefreshResponse {
 	t.Helper()
 	request, _ := json.Marshal(pluginapi.AuthRefreshRequest{AuthID: "kiro.json", StorageJSON: storage})

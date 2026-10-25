@@ -752,7 +752,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 
-	if e.isTokenExpired(accessToken) {
+	if e.isTokenExpired(auth, accessToken) {
 		return resp, errAccessTokenExpired
 	}
 
@@ -1013,7 +1013,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 
-	if e.isTokenExpired(accessToken) {
+	if e.isTokenExpired(auth, accessToken) {
 		return nil, errAccessTokenExpired
 	}
 
@@ -2980,11 +2980,24 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 // NOTE: Claude SSE event builders moved to internal/translator/kiro/claude/kiro_claude_stream.go
 // The executor now uses kiroclaude.BuildClaude*Event() functions instead
 
-// isTokenExpired checks if a JWT access token has expired.
-// Returns true if the token is expired or cannot be parsed.
-func (e *KiroExecutor) isTokenExpired(accessToken string) bool {
+// isTokenExpired checks if the access token has expired. The expiry the
+// credential records decides when it is readable, as cmd/kiro-plugin's
+// accessTokenExpired reads it: Kiro IdC access tokens are opaque, so only a JWT
+// carries its own expiry, which is the fallback. API keys do not expire.
+func (e *KiroExecutor) isTokenExpired(auth *cliproxyauth.Auth, accessToken string) bool {
 	if accessToken == "" {
 		return true
+	}
+	if isAPIKeyAuth(auth) {
+		return false
+	}
+	if auth != nil {
+		for _, key := range []string{"expires_at", "expiresAt"} {
+			value, _ := auth.Metadata[key].(string)
+			if expiresAt, err := time.Parse(time.RFC3339, strings.TrimSpace(value)); err == nil {
+				return !expiresAt.After(time.Now())
+			}
+		}
 	}
 
 	// JWT tokens have 3 parts separated by dots

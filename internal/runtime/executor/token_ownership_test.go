@@ -91,3 +91,36 @@ func TestExpiredAccessTokenReturnsUnauthorizedWithoutUpstreamCall(t *testing.T) 
 		}
 	}
 }
+
+// Kiro IdC access tokens are opaque, so their expiry is only known from the
+// expires_at the credential records. Reading the expiry from a JWT alone let
+// every expired opaque token reach Kiro.
+func TestExpiredOpaqueAccessTokenReturnsUnauthorizedWithoutUpstreamCall(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		expiresAt time.Time
+		expired   bool
+	}{
+		{name: "expired", expiresAt: time.Now().Add(-time.Minute), expired: true},
+		{name: "valid", expiresAt: time.Now().Add(time.Hour), expired: false},
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s stream=%v", test.name, stream), func(t *testing.T) {
+				requests := 0
+				stubUpstream(t, func(*http.Request) (*http.Response, error) {
+					requests++
+					return upstreamStatus(http.StatusOK, nil, ""), nil
+				})
+				auth := refreshableAuth(fmt.Sprintf("opaque-%s-%v", test.name, stream), "aoaAAAAAOpaqueAccessTokenWithoutDots")
+				auth.Metadata["expires_at"] = test.expiresAt.UTC().Format(time.RFC3339)
+				err := executeOnce(t, auth, stream)
+				if test.expired && statusOf(err) != http.StatusUnauthorized {
+					t.Fatalf("error = %v, want 401", err)
+				}
+				if reached := requests > 0; reached == test.expired {
+					t.Fatalf("token reached upstream %d times (err=%v), want expired=%v to decide", requests, err, test.expired)
+				}
+			})
+		}
+	}
+}

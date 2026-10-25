@@ -842,7 +842,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		// No client timeout: it covers the whole body, so it would cap generation
 		// length. The caller's context and ResponseHeaderTimeout still apply.
 		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
-		httpResp, err := httpClient.Do(httpReq)
+		httpResp, err := sendUpstream(httpClient, httpReq)
 		if err != nil {
 			// Check for context cancellation first - client disconnected, not a server error
 			// Use 499 (Client Closed Request - nginx convention) instead of 500
@@ -1105,7 +1105,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		})
 
 		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
-		httpResp, err := httpClient.Do(httpReq)
+		httpResp, err := sendUpstream(httpClient, httpReq)
 		if err != nil {
 			recordAPIResponseError(ctx, e.cfg, err)
 
@@ -1355,6 +1355,10 @@ func (e *EventStreamError) Error() string {
 	}
 	return fmt.Sprintf("event stream %s: %s", e.Type, e.Message)
 }
+
+// Unwrap exposes the read error, so a timeout or cancellation is classified
+// as one rather than as a generic connection failure.
+func (e *EventStreamError) Unwrap() error { return e.Cause }
 
 // eventStreamMessage represents a parsed AWS Event Stream message
 type eventStreamMessage struct {

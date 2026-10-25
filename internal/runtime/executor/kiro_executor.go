@@ -1414,6 +1414,10 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 			break
 		}
 
+		if err := eventStreamException(msg); err != nil {
+			return "", nil, nil, usageInfo, 0, stopReason, err
+		}
+
 		eventType := msg.EventType
 		payload := msg.Payload
 		if len(payload) == 0 {
@@ -2078,6 +2082,37 @@ func (e *KiroExecutor) eventStreamStringHeaders(headers []byte) map[string]strin
 	return values
 }
 
+// eventStreamException returns the error an AWS exception or error frame
+// carries, or nil for an event frame. Such a frame has no :event-type and may
+// have no payload, so it must be classified before either is looked at.
+func eventStreamException(msg *eventStreamMessage) error {
+	messageType := msg.Headers[":message-type"]
+	if messageType != "exception" && messageType != "error" {
+		return nil
+	}
+	errType := msg.Headers[":exception-type"]
+	if errType == "" {
+		errType = msg.Headers[":error-code"]
+	}
+	if errType == "" {
+		errType = messageType
+	}
+	errMsg := msg.Headers[":error-message"]
+	if errMsg == "" {
+		var body struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(msg.Payload, &body) == nil {
+			errMsg = body.Message
+		}
+	}
+	if errMsg == "" {
+		errMsg = errType
+	}
+	log.Errorf("kiro: received %s frame in event stream: type=%s, message=%s", messageType, errType, errMsg)
+	return streamStatusError(errType, errMsg)
+}
+
 // streamToChannel converts AWS Event Stream to channel-based streaming.
 // Supports tool calling - emits tool_use content blocks when tools are used.
 // Buffers official toolUseEvent input fragments without repairing malformed JSON.
@@ -2169,6 +2204,13 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			break
 		}
 		trace.record(msg)
+		if err := eventStreamException(msg); err != nil {
+			if contentBlockIndex < 0 {
+				log.Warnf("kiro: stream ended without a content block (credential=%s model=%s): %s", streamTraceLabel(ctx), model, &trace)
+			}
+			out <- cliproxyexecutor.StreamChunk{Err: err}
+			return false
+		}
 
 		eventType := msg.EventType
 		payload := msg.Payload

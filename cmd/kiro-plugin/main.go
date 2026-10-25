@@ -1223,9 +1223,6 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	// Returning AuthUpdate during model discovery restores the API-key kind and
 	// api_key attribute in the live auth record without requiring a CPA patch.
 	authUpdated := isAPIKeyCredential(token)
-	lock := credentialUsageLock(token, req.AuthID)
-	lock.Lock()
-	defer lock.Unlock()
 
 	// Registration must not wait on the network. CPA asks every credential in
 	// turn while it starts, after its port is already open, and every other
@@ -1233,10 +1230,15 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	// 2-8 s after everything else (measured 2026-09-25, starts at 15:29 and
 	// 16:27), so anything reading the model list at startup saw no Kiro models.
 	// The stored listing answers whatever the token's state: it is renewed by
-	// auth.refresh, which CPA schedules off the startup path.
+	// auth.refresh, which CPA schedules off the startup path. It reads only the
+	// request, so it does not queue behind a refresh or usage fetch holding the
+	// credential lock.
 	if stored, ok := storedModelCatalog(token); ok {
 		return modelsResponse(req, token, stored.Models, authUpdated)
 	}
+	lock := credentialUsageLock(token, req.AuthID)
+	lock.Lock()
+	defer lock.Unlock()
 	// Only a credential that has never been listed gets here. Listing never
 	// renews the token; renewal is auth.refresh, scheduled by CPA.
 	now := time.Now()

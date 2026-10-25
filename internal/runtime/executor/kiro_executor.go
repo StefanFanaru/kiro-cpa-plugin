@@ -747,11 +747,6 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
 
-	tokenKey := getTokenKey(auth)
-	if err := admitCredential(ctx, auth, tokenKey); err != nil {
-		return resp, err
-	}
-
 	if e.isTokenExpired(auth, accessToken) {
 		return resp, errAccessTokenExpired
 	}
@@ -768,6 +763,13 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	kiroModelID := e.mapModelToKiro(req.Model)
 	if err := prepareModelCapability(auth, kiroModelID, &opts); err != nil {
+		return resp, err
+	}
+
+	// Admitted last: a request refused by the checks above never reaches Kiro
+	// and must not take the credential's pacing slot.
+	tokenKey := getTokenKey(auth)
+	if err := admitCredential(ctx, auth, tokenKey); err != nil {
 		return resp, err
 	}
 
@@ -1008,11 +1010,6 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
 
-	tokenKey := getTokenKey(auth)
-	if err := admitCredential(ctx, auth, tokenKey); err != nil {
-		return nil, err
-	}
-
 	if e.isTokenExpired(auth, accessToken) {
 		return nil, errAccessTokenExpired
 	}
@@ -1029,6 +1026,13 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	kiroModelID := e.mapModelToKiro(req.Model)
 	if err := prepareModelCapability(auth, kiroModelID, &opts); err != nil {
+		return nil, err
+	}
+
+	// Admitted last: a request refused by the checks above never reaches Kiro
+	// and must not take the credential's pacing slot.
+	tokenKey := getTokenKey(auth)
+	if err := admitCredential(ctx, auth, tokenKey); err != nil {
 		return nil, err
 	}
 

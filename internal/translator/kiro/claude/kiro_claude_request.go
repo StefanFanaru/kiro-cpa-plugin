@@ -217,8 +217,9 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 // normalizeUnknownToolHistory prevents Kiro's REQUEST_BODY_INVALID response
 // when a long-running client compacts history and the current request no longer
 // declares a tool used by an older assistant turn. Structured replay is kept
-// for declared tools; unknown pairs are represented as text, preserving context
-// without violating Kiro's tool catalogue contract.
+// for declared tools; only the tool uses of undeclared tools and the results
+// answering them are represented as text, preserving context without violating
+// Kiro's tool catalogue contract or rewriting the rest of the history.
 //
 // The openai translator carries a byte-equivalent copy. The two are not shared
 // because each package declares its own KiroHistoryMessage/KiroToolResult/
@@ -229,41 +230,67 @@ func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUser
 	for _, tool := range tools {
 		toolNames[tool.ToolSpecification.Name] = struct{}{}
 	}
-	hasUnknown := false
-	for _, message := range history {
-		if message.AssistantResponseMessage == nil {
+	// A tool result answers the assistant turn just before it, so the ids
+	// flattened in one assistant turn are flattened in the next user turn.
+	var flattened map[string]struct{}
+	for i := range history {
+		if assistant := history[i].AssistantResponseMessage; assistant != nil {
+			flattened = nil
+			var kept, unknown []KiroToolUse
+			for _, toolUse := range assistant.ToolUses {
+				if _, ok := toolNames[toolUse.Name]; ok {
+					kept = append(kept, toolUse)
+					continue
+				}
+				unknown = append(unknown, toolUse)
+				if flattened == nil {
+					flattened = make(map[string]struct{})
+				}
+				flattened[toolUse.ToolUseID] = struct{}{}
+			}
+			if len(unknown) > 0 {
+				assistant.Content = appendHistoryText(assistant.Content, formatToolUses(unknown))
+				assistant.ToolUses = kept
+			}
 			continue
 		}
-		for _, toolUse := range message.AssistantResponseMessage.ToolUses {
-			if _, ok := toolNames[toolUse.Name]; !ok {
-				hasUnknown = true
-				break
+		if user := history[i].UserInputMessage; user != nil && user.UserInputMessageContext != nil && len(flattened) > 0 {
+			var text string
+			user.UserInputMessageContext.ToolResults, text = splitFlattenedToolResults(user.UserInputMessageContext.ToolResults, flattened)
+			if text != "" {
+				user.Content = appendHistoryText(user.Content, text)
 			}
-		}
-		if hasUnknown {
-			break
-		}
-	}
-	if !hasUnknown {
-		return history, currentResults
-	}
-	for i := range history {
-		if assistant := history[i].AssistantResponseMessage; assistant != nil && len(assistant.ToolUses) > 0 {
-			assistant.Content = appendHistoryText(assistant.Content, formatToolUses(assistant.ToolUses))
-			assistant.ToolUses = nil
-		}
-		if user := history[i].UserInputMessage; user != nil && user.UserInputMessageContext != nil && len(user.UserInputMessageContext.ToolResults) > 0 {
-			user.Content = appendHistoryText(user.Content, formatToolResults(user.UserInputMessageContext.ToolResults))
-			user.UserInputMessageContext.ToolResults = nil
-			if len(user.UserInputMessageContext.Tools) == 0 {
+			if len(user.UserInputMessageContext.ToolResults) == 0 && len(user.UserInputMessageContext.Tools) == 0 {
 				user.UserInputMessageContext = nil
 			}
 		}
+		flattened = nil
 	}
-	if current != nil && len(currentResults) > 0 {
-		current.Content = appendHistoryText(current.Content, formatToolResults(currentResults))
+	if current != nil && len(flattened) > 0 {
+		var text string
+		currentResults, text = splitFlattenedToolResults(currentResults, flattened)
+		if text != "" {
+			current.Content = appendHistoryText(current.Content, text)
+		}
 	}
-	return history, nil
+	return history, currentResults
+}
+
+// splitFlattenedToolResults keeps the results whose tool use stayed
+// structured and renders the others as text.
+func splitFlattenedToolResults(results []KiroToolResult, flattened map[string]struct{}) ([]KiroToolResult, string) {
+	var kept, unknown []KiroToolResult
+	for _, result := range results {
+		if _, ok := flattened[result.ToolUseID]; ok {
+			unknown = append(unknown, result)
+		} else {
+			kept = append(kept, result)
+		}
+	}
+	if len(unknown) == 0 {
+		return results, ""
+	}
+	return kept, formatToolResults(unknown)
 }
 
 func appendHistoryText(content, extra string) string {

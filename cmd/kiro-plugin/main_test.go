@@ -916,6 +916,30 @@ func TestConfigurePluginIgnoresNonSettingsKiroKeys(t *testing.T) {
 	}
 }
 
+func TestReconfigureKeepsParkedCredential(t *testing.T) {
+	configurePlugin(nil)
+	kiroauth.GetGlobalRateLimiter().MarkUnavailable("token-abc", kiroauth.ReasonMonthlyLimit, time.Hour)
+	configurePlugin(nil)
+	if _, _, unavailable := kiroauth.GetGlobalRateLimiter().TokenUnavailable("token-abc"); !unavailable {
+		t.Fatal("reconfigure forgot that the credential is out of rotation for its monthly limit")
+	}
+}
+
+func TestReconfigureKeepsPacing(t *testing.T) {
+	configurePlugin(nil)
+	if err := kiroauth.GetGlobalRateLimiter().WaitForToken(context.Background(), "token-pace"); err != nil {
+		t.Fatal(err)
+	}
+	configurePlugin(nil)
+	start := time.Now()
+	if err := kiroauth.GetGlobalRateLimiter().WaitForToken(context.Background(), "token-pace"); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(start); waited < 500*time.Millisecond {
+		t.Fatalf("second request on the same credential waited %v after reconfigure; pacing was reset", waited)
+	}
+}
+
 func TestFindKiroConfigIsDeterministicAcrossCompetingKeys(t *testing.T) {
 	// Go randomises map iteration, so two competing "kiro" maps must still
 	// resolve to the same one on every call.

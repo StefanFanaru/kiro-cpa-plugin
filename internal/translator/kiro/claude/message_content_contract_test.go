@@ -274,3 +274,63 @@ func TestBuildKiroPayloadReplaysOnlyTheFirstSignedThinkingBlock(t *testing.T) {
 		t.Fatalf("reasoning = %#v, want text one with sig1", rc.ReasoningText)
 	}
 }
+
+func TestBuildKiroPayloadDropsBillingHeaderAndSeparatesSystemBlocks(t *testing.T) {
+	t.Parallel()
+	payload := buildTestPayload(t, `{
+		"system":[
+			{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.300.abc; cc_entrypoint=cli; cch=1a2b3;"},
+			{"type":"text","text":"You are Claude Code."},
+			{"type":"text","text":"Main prompt."}
+		],
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "You are Claude Code.\n\nMain prompt.\n\nhi" {
+		t.Fatalf("current content = %q", got)
+	}
+}
+
+// Claude Code sends a billing fingerprint as the first system block, and it
+// differs between requests of one conversation. Kiro caches the request
+// prefix, so it must not reach history[0].
+func TestBillingHeaderDoesNotChangeKiroHistory(t *testing.T) {
+	t.Parallel()
+	turn := func(fingerprint string) string {
+		payload := buildTestPayload(t, `{
+			"system":[
+				{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.300.abc; cc_entrypoint=cli; cch=`+fingerprint+`;"},
+				{"type":"text","text":"You are Claude Code."}
+			],
+			"messages":[
+				{"role":"user","content":"start"},
+				{"role":"assistant","content":"working"},
+				{"role":"user","content":"continue"}
+			]
+		}`)
+		history, err := json.Marshal(payload.ConversationState.History)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(history)
+	}
+	if first, second := turn("1a2b3"), turn("4c5d6"); first != second {
+		t.Fatalf("history differs between turns:\n%s\n%s", first, second)
+	}
+}
+
+func TestBuildKiroPayloadSeparatesTextBlocks(t *testing.T) {
+	t.Parallel()
+	payload := buildTestPayload(t, `{
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},
+			{"role":"assistant","content":[{"type":"text","text":"alpha"},{"type":"text","text":"beta"}]},
+			{"role":"user","content":"ok"}
+		]
+	}`)
+	if got := payload.ConversationState.History[0].UserInputMessage.Content; got != "first\nsecond" {
+		t.Errorf("user content = %q, want first\\nsecond", got)
+	}
+	if got := payload.ConversationState.History[1].AssistantResponseMessage.Content; got != "alpha\nbeta" {
+		t.Errorf("assistant content = %q, want alpha\\nbeta", got)
+	}
+}

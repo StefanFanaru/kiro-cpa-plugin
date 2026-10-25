@@ -290,6 +290,19 @@ func TestBuildKiroPayloadDropsBillingHeaderAndSeparatesSystemBlocks(t *testing.T
 	}
 }
 
+// The fingerprint is one line. A client that sends it in the same block as
+// its instructions lost the instructions too.
+func TestBillingHeaderKeepsTextSharingItsBlock(t *testing.T) {
+	t.Parallel()
+	payload := buildTestPayload(t, `{
+		"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.300.abc; cch=1a2b3;\nYou are Claude Code."}],
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "You are Claude Code.\n\nhi" {
+		t.Fatalf("current content = %q", got)
+	}
+}
+
 // Claude Code sends a billing fingerprint as the first system block, and it
 // differs between requests of one conversation. Kiro caches the request
 // prefix, so it must not reach history[0].

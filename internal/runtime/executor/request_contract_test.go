@@ -204,3 +204,10 @@ func TestValidateKiroRequestRejectsInvalidImageData(t *testing.T) {
 		t.Fatal("invalid image data was accepted")
 	}
 }
+
+func TestValidateKiroRequestRejectsInvalidToolResultImageData(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"shot"},{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"screenshot","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"media_type":"image/png","data":"not-base64"}}]}]}]}`)
+	if err := validateKiroRequest(body, body, sdktranslator.FormatClaude); err == nil {
+		t.Fatal("invalid tool_result image data was accepted")
+	}
+}

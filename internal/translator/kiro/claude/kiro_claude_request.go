@@ -463,21 +463,8 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 			case "text":
 				contentBuilder.WriteString(part.Get("text").String())
 			case "image":
-				mediaType := part.Get("source.media_type").String()
-				data := part.Get("source.data").String()
-
-				format := ""
-				if idx := strings.LastIndex(mediaType, "/"); idx != -1 {
-					format = mediaType[idx+1:]
-				}
-
-				if format != "" && data != "" {
-					images = append(images, KiroImage{
-						Format: format,
-						Source: KiroImageSource{
-							Bytes: data,
-						},
-					})
+				if image, ok := kiroImageFromClaudeBlock(part); ok {
+					images = append(images, image)
 				}
 			case "tool_result":
 				toolUseID := part.Get("tool_use_id").String()
@@ -486,6 +473,7 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 				resultContent := part.Get("content")
 
 				var textContents []KiroTextContent
+				hasImage := false
 
 				if resultContent.IsArray() {
 					for _, item := range resultContent.Array() {
@@ -493,13 +481,22 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 							textContents = append(textContents, KiroTextContent{Text: item.Get("text").String()})
 						} else if item.Type == gjson.String {
 							textContents = append(textContents, KiroTextContent{Text: item.String()})
+						} else if item.Get("type").String() == "image" {
+							// Kiro tool results carry text only; the image rides on
+							// the enclosing user message, as top-level images do.
+							if image, ok := kiroImageFromClaudeBlock(item); ok {
+								images = append(images, image)
+								hasImage = true
+							}
 						}
 					}
 				} else if resultContent.Type == gjson.String {
 					textContents = append(textContents, KiroTextContent{Text: resultContent.String()})
 				}
 
-				if len(textContents) == 0 {
+				if len(textContents) == 0 && hasImage {
+					textContents = append(textContents, KiroTextContent{Text: toolResultImagePlaceholder})
+				} else if len(textContents) == 0 {
 					textContents = append(textContents, KiroTextContent{Text: ""})
 				}
 
@@ -530,6 +527,26 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 	}
 
 	return userMsg, toolResults
+}
+
+// toolResultImagePlaceholder stands in for a tool result whose only content is
+// an image, so the result does not read as empty next to the attached image.
+const toolResultImagePlaceholder = "[image attached]"
+
+// kiroImageFromClaudeBlock converts a base64 Claude image block into a Kiro
+// image; it reports false when the media type or data is missing.
+func kiroImageFromClaudeBlock(part gjson.Result) (KiroImage, bool) {
+	mediaType := part.Get("source.media_type").String()
+	data := part.Get("source.data").String()
+
+	format := ""
+	if idx := strings.LastIndex(mediaType, "/"); idx != -1 {
+		format = mediaType[idx+1:]
+	}
+	if format == "" || data == "" {
+		return KiroImage{}, false
+	}
+	return KiroImage{Format: format, Source: KiroImageSource{Bytes: data}}, true
 }
 
 // BuildAssistantMessageStruct builds an assistant message with tool uses

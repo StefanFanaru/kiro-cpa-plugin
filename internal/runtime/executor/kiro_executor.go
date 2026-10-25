@@ -220,6 +220,9 @@ func getKiroPooledHTTPClient() *http.Client {
 
 			// Enable HTTP/2 when available
 			ForceAttemptHTTP2: true,
+
+			// Drop an HTTP/2 connection whose peer went silent
+			HTTP2: http2HealthCheck(),
 		}
 
 		kiroHTTPClientPool = &http.Client{

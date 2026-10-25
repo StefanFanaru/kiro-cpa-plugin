@@ -82,3 +82,58 @@ func TestFirstFrameErrorIsTheFirstChunk(t *testing.T) {
 		}
 	}
 }
+
+// Text or reasoning that arrives while a tool_use block is open would open a
+// second block before the first is closed, and the remaining input fragments
+// would go to the wrong index. Kiro has not been seen doing this, so the
+// stream fails instead of guessing which block the events belong to.
+func TestTextDuringOpenToolBlockFailsTheStream(t *testing.T) {
+	t.Parallel()
+
+	for name, interloper := range map[string][]byte{
+		"text":      kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":"hi"}}`),
+		"reasoning": kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"text":"hmm"}}`),
+	} {
+		body := kiroEventStream(
+			kiroEvent("toolUseEvent", `{"toolUseEvent":{"toolUseId":"call_1","name":"write_file","input":"{\"path\":"}}`),
+			interloper,
+			kiroEvent("toolUseEvent", `{"toolUseEvent":{"toolUseId":"call_1","name":"write_file","input":"\"a.md\"}"}}`),
+			kiroEvent("toolUseEvent", `{"toolUseEvent":{"toolUseId":"call_1","name":"write_file","stop":true}}`),
+		)
+		ok, chunks := collectStream(t, body)
+		open := map[int64]string{}
+		var problems []string
+		var streamErr error
+		for _, chunk := range chunks {
+			if chunk.Err != nil {
+				streamErr = chunk.Err
+				continue
+			}
+			data := eventData(chunk.Payload)
+			index := data.Get("index").Int()
+			switch data.Get("type").String() {
+			case "content_block_start":
+				if len(open) > 0 {
+					problems = append(problems, "start while another block is open")
+				}
+				open[index] = data.Get("content_block.type").String()
+			case "content_block_delta":
+				want := map[string]string{"input_json_delta": "tool_use", "text_delta": "text", "thinking_delta": "thinking"}[data.Get("delta.type").String()]
+				if open[index] != want {
+					problems = append(problems, data.Get("delta.type").String()+" on "+open[index]+" block")
+				}
+			case "content_block_stop":
+				if _, ok := open[index]; !ok {
+					problems = append(problems, "stop for a closed block")
+				}
+				delete(open, index)
+			}
+		}
+		if len(problems) > 0 {
+			t.Errorf("%s: block sequence broken: %v", name, problems)
+		}
+		if ok || streamErr == nil {
+			t.Errorf("%s: ok=%v err=%v, want the stream to fail", name, ok, streamErr)
+		}
+	}
+}

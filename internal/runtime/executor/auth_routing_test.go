@@ -494,3 +494,24 @@ func TestUnavailableStatusByReason(t *testing.T) {
 		}
 	}
 }
+
+// A non-stream request reads the whole generation before it returns, so a
+// client timeout caps generation length: long Opus runs failed at 120s and
+// CPA retried them to 480s. Only the caller's context may bound the request.
+func TestNonStreamClientHasNoTimeout(t *testing.T) {
+	original := kiroHTTPClientFor
+	t.Cleanup(func() { kiroHTTPClientFor = original })
+	var timeouts []time.Duration
+	kiroHTTPClientFor = func(_ context.Context, _ *config.Config, _ *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+		timeouts = append(timeouts, timeout)
+		return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return upstreamStatus(http.StatusTooManyRequests, nil, "{\"message\":\"stop\"}"), nil
+		})}
+	}
+	request, options := executorTestRequest()
+
+	_, _ = NewKiroExecutor(nil).Execute(t.Context(), builderIDAuth("non-stream-timeout"), request, options)
+	if len(timeouts) != 1 || timeouts[0] != 0 {
+		t.Fatalf("non-stream client timeouts = %v, want [0]", timeouts)
+	}
+}

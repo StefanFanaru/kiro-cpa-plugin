@@ -827,7 +827,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			AuthValue: authValue,
 		})
 
-		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 120*time.Second)
+		// No client timeout: it covers the whole body, so it would cap generation
+		// length. The caller's context and ResponseHeaderTimeout still apply.
+		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
 		httpResp, err := httpClient.Do(httpReq)
 		if err != nil {
 			// Check for context cancellation first - client disconnected, not a server error

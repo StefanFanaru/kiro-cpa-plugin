@@ -39,6 +39,13 @@ type tokenState struct {
 	nextSlot          time.Time
 	unavailableUntil  time.Time
 	unavailableReason string
+	// pending holds the reservations of waiters still sleeping, in slot order.
+	pending []*reservation
+}
+
+type reservation struct {
+	slot      time.Time
+	cancelled bool
 }
 
 // RateLimiterConfig carries the plugin settings; zero fields keep the default.
@@ -105,7 +112,9 @@ func (rl *RateLimiter) calculateInterval() time.Duration {
 
 // WaitForToken blocks until the credential's next request slot or until ctx
 // ends. The slot is reserved before sleeping, so concurrent callers on one
-// credential queue behind each other instead of waking together.
+// credential queue behind each other instead of waking together. A waiter
+// whose ctx ends gives its slot back once no live waiter is queued behind it,
+// so abandoned requests do not push the credential's next slot into the future.
 func (rl *RateLimiter) WaitForToken(ctx context.Context, tokenKey string) error {
 	rl.mu.Lock()
 	state := rl.state(tokenKey)
@@ -114,19 +123,48 @@ func (rl *RateLimiter) WaitForToken(ctx context.Context, tokenKey string) error 
 		slot = now
 	}
 	state.nextSlot = slot.Add(rl.calculateInterval())
-	rl.mu.Unlock()
-
 	wait := time.Until(slot)
 	if wait <= 0 {
+		rl.mu.Unlock()
 		return ctx.Err()
 	}
+	reserved := &reservation{slot: slot}
+	state.pending = append(state.pending, reserved)
+	rl.mu.Unlock()
+
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		rl.finish(state, reserved, false)
 		return nil
 	case <-ctx.Done():
+		rl.finish(state, reserved, true)
 		return ctx.Err()
+	}
+}
+
+// finish drops a waiter's reservation. A served one also drops every
+// reservation ahead of it, whose slots can no longer be given back. A
+// cancelled one is only marked; the trailing run of cancelled reservations is
+// then rolled back, which keeps every live waiter's slot and the gap after the
+// last of them.
+func (rl *RateLimiter) finish(state *tokenState, reserved *reservation, cancelled bool) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if cancelled {
+		reserved.cancelled = true
+	} else {
+		for i, pending := range state.pending {
+			if pending == reserved {
+				state.pending = state.pending[i+1:]
+				break
+			}
+		}
+	}
+	for n := len(state.pending); n > 0 && state.pending[n-1].cancelled; n-- {
+		state.nextSlot = state.pending[n-1].slot
+		state.pending = state.pending[:n-1]
 	}
 }
 

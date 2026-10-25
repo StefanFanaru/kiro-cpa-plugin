@@ -141,8 +141,8 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 
 	tools := gjson.GetBytes(openaiBody, "tools")
 
-	// Extract system prompt from messages
-	systemPrompt := extractSystemPromptFromOpenAI(messages)
+	// Extract system prompt from the leading system messages
+	systemPrompt, messages := splitOpenAISystemMessages(messages)
 
 	thinkingEnabled := effort != "" && effort != "none"
 
@@ -369,31 +369,65 @@ func normalizeOrigin(origin string) string {
 	}
 }
 
-// extractSystemPromptFromOpenAI extracts system prompt from OpenAI messages
-func extractSystemPromptFromOpenAI(messages gjson.Result) string {
+// splitOpenAISystemMessages returns the text of the leading system and
+// developer messages, sent as instructions in front of the first user turn,
+// and the messages with every later system or developer message turned into
+// user text at its own position. Kiro has no system role, and its prompt cache
+// matches the request prefix: hoisting a later system message in front of the
+// first user turn changed the oldest history entry whenever a client added
+// one, so no later turn reused the cache.
+func splitOpenAISystemMessages(messages gjson.Result) (string, gjson.Result) {
 	if !messages.IsArray() {
-		return ""
+		return "", messages
 	}
 
 	var systemParts []string
+	leading := true
+	changed := false
+	kept := make([]string, 0, len(messages.Array()))
 	for _, msg := range messages.Array() {
 		role := msg.Get("role").String()
-		if role == "system" || role == "developer" {
-			content := msg.Get("content")
-			if content.Type == gjson.String {
-				systemParts = append(systemParts, content.String())
-			} else if content.IsArray() {
-				// Handle array content format
-				for _, part := range content.Array() {
-					if part.Get("type").String() == "text" {
-						systemParts = append(systemParts, part.Get("text").String())
-					}
-				}
+		if role != "system" && role != "developer" {
+			leading = false
+			kept = append(kept, msg.Raw)
+			continue
+		}
+		parts := openAISystemTextParts(msg.Get("content"))
+		if leading {
+			systemParts = append(systemParts, parts...)
+			kept = append(kept, msg.Raw)
+			continue
+		}
+		changed = true
+		text := strings.Join(parts, "\n")
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		// processOpenAIMessages merges it with neighbouring user turns.
+		raw, _ := json.Marshal(map[string]string{"role": "user", "content": text})
+		kept = append(kept, string(raw))
+	}
+	if changed {
+		messages = gjson.Parse("[" + strings.Join(kept, ",") + "]")
+	}
+
+	return strings.Join(systemParts, "\n"), messages
+}
+
+// openAISystemTextParts returns the text of a system or developer message.
+func openAISystemTextParts(content gjson.Result) []string {
+	var parts []string
+	if content.Type == gjson.String {
+		parts = append(parts, content.String())
+	} else if content.IsArray() {
+		// Handle array content format
+		for _, part := range content.Array() {
+			if part.Get("type").String() == "text" {
+				parts = append(parts, part.Get("text").String())
 			}
 		}
 	}
-
-	return strings.Join(systemParts, "\n")
+	return parts
 }
 
 // convertOpenAIToolsToKiro converts OpenAI tools to Kiro format
@@ -457,7 +491,7 @@ func processOpenAIMessages(messages gjson.Result, modelID, origin string) ([]Kir
 
 		switch role {
 		case "system", "developer":
-			// System messages are handled separately via extractSystemPromptFromOpenAI
+			// System messages are handled separately via splitOpenAISystemMessages
 			continue
 
 		case "user":

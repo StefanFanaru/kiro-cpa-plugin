@@ -147,3 +147,29 @@ func TestFoldingInstructionsKeepsTheUserTurn(t *testing.T) {
 		t.Fatalf("instruction lost: %s", text)
 	}
 }
+
+// Kiro caches the request prefix, from history[0] onward. A system message the
+// client inserts mid-conversation must stay at its own position: hoisting it
+// in front of the first user turn changed history[0] on the next request and
+// made every later turn a cache miss.
+func TestInlineSystemMessageKeepsEarlierKiroHistory(t *testing.T) {
+	build := func(body string) KiroPayload {
+		raw, _ := BuildKiroPayloadFromOpenAI([]byte(body), "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+		var payload KiroPayload
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+	turn1 := build(`{"messages":[{"role":"system","content":"Base."},{"role":"user","content":"q1"},{"role":"assistant","content":"a1"},{"role":"user","content":"q2"}]}`)
+	turn2 := build(`{"messages":[{"role":"system","content":"Base."},{"role":"user","content":"q1"},{"role":"assistant","content":"a1"},{"role":"user","content":"q2"},{"role":"assistant","content":"a2"},{"role":"developer","content":[{"type":"text","text":"Reminder:"},{"type":"text","text":"date changed."}]},{"role":"user","content":"q3"}]}`)
+
+	first := turn1.ConversationState.History[0].UserInputMessage.Content
+	second := turn2.ConversationState.History[0].UserInputMessage.Content
+	if first != "Base.\n\nq1" || second != first {
+		t.Errorf("history[0] changed: %q -> %q", first, second)
+	}
+	if got := turn2.ConversationState.CurrentMessage.UserInputMessage.Content; got != "Reminder:\ndate changed.\nq3" {
+		t.Errorf("current content = %q", got)
+	}
+}

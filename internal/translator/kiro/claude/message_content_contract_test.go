@@ -226,3 +226,28 @@ func TestBuildKiroPayloadFlattensOnlyUndeclaredToolPairs(t *testing.T) {
 		t.Errorf("current tool results = %q content = %q, want c kept and d flattened", got, current.Content)
 	}
 }
+
+func TestBuildKiroPayloadKeepsToolInputNumbersExact(t *testing.T) {
+	t.Parallel()
+	raw, _ := BuildKiroPayload([]byte(`{
+		"messages":[
+			{"role":"user","content":"go"},
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"a","name":"T","input":{"id":12345678901234567890,"nested":{"small":9007199254740993}}},
+				{"type":"tool_use","id":"b","name":"T","input":{"z":{"y":1.5,"x":"a<b"},"a":[{"k":2,"j":true}]}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"ok"},{"type":"tool_result","tool_use_id":"b","content":"ok"}]}
+		],
+		"tools":[{"name":"T","description":"T","input_schema":{"type":"object"}}]
+	}`), "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	want := `"input":{"id":12345678901234567890,"nested":{"small":9007199254740993}}`
+	if !strings.Contains(string(raw), want) {
+		t.Fatalf("tool_use input changed, want %s in:\n%s", want, raw)
+	}
+	// Other values keep the rendering existing history was cached with:
+	// sorted keys at every depth and HTML-escaped strings.
+	want = `"input":{"a":[{"j":true,"k":2}],"z":{"x":"a\u003cb","y":1.5}}`
+	if !strings.Contains(string(raw), want) {
+		t.Fatalf("tool_use input rendering changed, want %s in:\n%s", want, raw)
+	}
+}

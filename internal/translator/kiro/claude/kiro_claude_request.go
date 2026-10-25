@@ -382,7 +382,7 @@ func normalizeOrigin(origin string) string {
 	}
 }
 
-// claudeBillingHeaderPrefix starts the system block in which Claude Code sends
+// claudeBillingHeaderPrefix starts the system line in which Claude Code sends
 // a per-request billing fingerprint. It means nothing to Kiro and, because
 // instructions lead history[0], would change Kiro's cached prefix whenever the
 // fingerprint changes.
@@ -400,7 +400,10 @@ func extractSystemPrompt(claudeBody []byte) string {
 			} else if block.Type == gjson.String {
 				text = block.String()
 			}
-			if text != "" && !strings.HasPrefix(text, claudeBillingHeaderPrefix) {
+			if strings.HasPrefix(text, claudeBillingHeaderPrefix) {
+				_, text, _ = strings.Cut(text, "\n")
+			}
+			if text != "" {
 				parts = append(parts, text)
 			}
 		}

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,7 +20,8 @@ import (
 
 // routeToServer sends executor requests to target through a clone of the
 // production pooled transport, so real connection and body behaviour applies.
-func routeToServer(t *testing.T, target string) {
+// The clone is returned for tests that shorten its timings.
+func routeToServer(t *testing.T, target string) *http.Transport {
 	t.Helper()
 	parsed, err := url.Parse(target)
 	if err != nil {
@@ -39,12 +41,13 @@ func routeToServer(t *testing.T, target string) {
 			return transport.RoundTrip(r)
 		})}
 	}
+	return transport
 }
 
 // The plugin runs on context.Background(), and nothing limited the silence
 // between two reads of a 2xx body: an upstream that sent its headers and then
 // stopped held Execute, or the stream goroutine, forever. Both paths must give
-// up after the idle limit and report a gateway timeout.
+// up after the idle limit and report it as the transport timeout it is.
 func TestStalledUpstreamBodyTimesOut(t *testing.T) {
 	originalIdle := upstreamIdleTimeout
 	upstreamIdleTimeout = 200 * time.Millisecond
@@ -88,10 +91,7 @@ func TestStalledUpstreamBodyTimesOut(t *testing.T) {
 			go func() { result <- test.execute() }()
 			select {
 			case err := <-result:
-				status, ok := err.(interface{ StatusCode() int })
-				if !ok || status.StatusCode() != http.StatusGatewayTimeout {
-					t.Fatalf("stalled body = %T %v, want a gateway timeout", err, err)
-				}
+				assertTransportFailure(t, err, "i/o timeout")
 			case <-time.After(3 * time.Second):
 				t.Fatal("still blocked after 3s of upstream silence")
 			}
@@ -153,6 +153,60 @@ func TestTransportErrorIsRetriedOnlyWhenTheRequestWasNotSent(t *testing.T) {
 			if err == nil || retries.Load() != 2 {
 				t.Fatalf("refused connection retried %d times (err=%v), want 2", retries.Load(), err)
 			}
+		})
+	}
+}
+
+// assertTransportFailure checks that err carries no HTTP status and keeps the
+// transport cause in its text, which is all the host sees across the plugin
+// ABI.
+func assertTransportFailure(t *testing.T, err error, cause string) {
+	t.Helper()
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != 0 || !strings.Contains(err.Error(), cause) {
+		t.Fatalf("transport failure = %T %v, want status 0 with %q in the message", err, err, cause)
+	}
+}
+
+// A transport failure is a property of the connection, which both Kiro
+// credentials share, not of the credential. Reported as 502 or 504, it made CPA
+// cool the credential for its transient-error window; with no status, CPA
+// decides from the message, so the cause text must survive.
+func TestTransportFailureCarriesNoStatus(t *testing.T) {
+	release := make(chan struct{})
+	silent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	t.Cleanup(silent.Close)
+	t.Cleanup(func() { close(release) })
+	reset := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		_ = conn.(*net.TCPConn).SetLinger(0)
+		_ = conn.Close()
+	}))
+	t.Cleanup(reset.Close)
+
+	paths := map[string]func(*cliproxyauth.Auth) error{
+		"non-stream": func(auth *cliproxyauth.Auth) error {
+			request, options := executorTestRequest()
+			_, err := NewKiroExecutor(nil).Execute(context.Background(), auth, request, options)
+			return err
+		},
+		"stream": func(auth *cliproxyauth.Auth) error {
+			request, options := executorTestRequest()
+			_, err := NewKiroExecutor(nil).ExecuteStream(context.Background(), auth, request, options)
+			return err
+		},
+	}
+	for name, execute := range paths {
+		t.Run(name+"/reset", func(t *testing.T) {
+			routeToServer(t, reset.URL)
+			assertTransportFailure(t, execute(builderIDAuth("reset-"+name)), "connection reset")
+		})
+		t.Run(name+"/no response headers", func(t *testing.T) {
+			routeToServer(t, silent.URL).ResponseHeaderTimeout = 100 * time.Millisecond
+			assertTransportFailure(t, execute(builderIDAuth("headers-"+name)), "timeout awaiting response headers")
 		})
 	}
 }

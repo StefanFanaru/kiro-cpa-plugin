@@ -112,7 +112,9 @@ const (
 var pluginVersion = "dev"
 
 var (
-	hostAPI        *C.cliproxy_host_api
+	// hostAPI is cleared by the shutdown export while plugin goroutines may
+	// still call back into the host, so it is read and written atomically.
+	hostAPI        atomic.Pointer[C.cliproxy_host_api]
 	pluginConfig   = &config.Config{AuthDir: "~/.cli-proxy-api"}
 	kiroExecutor   = kiroexecutor.NewKiroExecutor(pluginConfig)
 	pluginSettings = defaultPluginSettings()
@@ -203,7 +205,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if plugin == nil {
 		return 1
 	}
-	hostAPI = host
+	hostAPI.Store(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -262,7 +264,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() { hostAPI = nil }
+func cliproxyPluginShutdown() { hostAPI.Store(nil) }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
@@ -2128,7 +2130,8 @@ func validateRegion(region string) error {
 }
 
 func hostCall(method string, request []byte) ([]byte, error) {
-	if hostAPI == nil || hostAPI.call == nil {
+	api := hostAPI.Load()
+	if api == nil || api.call == nil {
 		return nil, errors.New("host API unavailable")
 	}
 	cMethod := C.CString(method)
@@ -2139,13 +2142,13 @@ func hostCall(method string, request []byte) ([]byte, error) {
 		defer C.free(cRequest)
 	}
 	var response C.cliproxy_buffer
-	rc := C.kiro_call_host(hostAPI, cMethod, (*C.uint8_t)(cRequest), C.size_t(len(request)), &response)
+	rc := C.kiro_call_host(api, cMethod, (*C.uint8_t)(cRequest), C.size_t(len(request)), &response)
 	var out []byte
 	if response.ptr != nil && response.len > 0 {
 		out = C.GoBytes(response.ptr, C.int(response.len))
 	}
-	if response.ptr != nil && hostAPI.free_buffer != nil {
-		C.kiro_free_host_buffer(hostAPI, response.ptr, response.len)
+	if response.ptr != nil && api.free_buffer != nil {
+		C.kiro_free_host_buffer(api, response.ptr, response.len)
 	}
 	if rc != 0 {
 		return out, fmt.Errorf("host call %s returned %d", method, int(rc))

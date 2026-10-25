@@ -2013,17 +2013,36 @@ func collectStream(result *coreexec.StreamResult, cancel context.CancelFunc) ([]
 // Cancelling first makes that finish now rather than when Kiro stops generating.
 func pumpStream(streamID string, chunks <-chan coreexec.StreamChunk, cancel context.CancelFunc) {
 	var streamErr error
+	emitting, closeHost := false, true
 	defer func() {
 		cancel()
 		drainStream(chunks)
-		streamClose(streamID, streamErr)
+		if closeHost {
+			streamClose(streamID, streamErr)
+		}
+	}()
+	// This goroutine runs outside callHandler's recover, and a panic in a
+	// plugin goroutine ends the CPA process. A panic in the host emit leaves the
+	// host alone; any other closes the stream with an error.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("kiro: panic pumping stream %s: %v\n%s", streamID, recovered, debug.Stack())
+			closeHost = !emitting
+			streamErr = pluginStatusError{status: http.StatusInternalServerError, message: "kiro: internal error streaming the response"}
+		}
 	}()
 	for chunk := range chunks {
 		if chunk.Err != nil {
 			streamErr = chunk.Err
 			return
 		}
-		if len(chunk.Payload) > 0 && streamEmit(streamID, chunk.Payload) != nil {
+		if len(chunk.Payload) == 0 {
+			continue
+		}
+		emitting = true
+		err := streamEmit(streamID, chunk.Payload)
+		emitting = false
+		if err != nil {
 			return
 		}
 	}

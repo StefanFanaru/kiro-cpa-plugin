@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -640,6 +641,14 @@ func collectUsageAccounts(ctx context.Context, refresh string) []usageAccountVie
 			defer group.Done()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
+			// This goroutine runs outside callHandler's recover, and a panic in
+			// a plugin goroutine ends the CPA process. Contain it to the account.
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("kiro: panic reading usage for %s: %v\n%s", credentials[index].entry.Name, recovered, debug.Stack())
+					results[index] = usagePanicView(credentials[index])
+				}
+			}()
 			force := refresh == usageRefreshAll || (refresh != "" && refresh == filepath.Base(credentials[index].entry.Name))
 			results[index] = loadUsageCredential(ctx, credentials[index], force)
 		}()
@@ -654,6 +663,17 @@ func collectUsageAccounts(ctx context.Context, refresh string) []usageAccountVie
 		return strings.ToLower(usageDisplayName(results[i])) < strings.ToLower(usageDisplayName(results[j]))
 	})
 	return results
+}
+
+// usagePanicView is the failed view of an account whose read panicked.
+func usagePanicView(credential usageCredential) usageAccountView {
+	err := errors.New("kiro: internal error reading usage")
+	account := usageAccountView{
+		Label: kiroUsageLabel(credential.token), State: "Unavailable", StateKey: usageStateUnavailable, StateClass: "error",
+		Error: publicUsageError(err), ErrorKey: publicUsageErrorKey(err),
+	}
+	decorateUsageAccount(&account, credential, nil)
+	return account
 }
 
 // usageNeedsAttention is the page's single test for a credential that is not

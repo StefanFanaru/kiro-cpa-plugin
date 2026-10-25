@@ -401,14 +401,15 @@ func validateClaudeConversation(body []byte, source string) error {
 func validateOpenAIConversation(body []byte) error {
 	messages := gjson.GetBytes(body, "messages").Array()
 	firstRole := ""
+	foundFirst := false
 	for _, message := range messages {
 		if err := validateKiroContentBlocks(message.Get("content"), sdktranslator.FormatOpenAI.String()); err != nil {
 			return requestValidationErr{msg: err.Error()}
 		}
 		role := message.Get("role").String()
-		if role != "system" && role != "developer" {
+		if !foundFirst && role != "system" && role != "developer" {
 			firstRole = role
-			break
+			foundFirst = true
 		}
 	}
 	if firstRole == "" {

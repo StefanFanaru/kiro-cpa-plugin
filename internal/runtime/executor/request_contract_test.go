@@ -152,6 +152,19 @@ func TestNormalizeKiroToolsUsesNameForEmptyDescription(t *testing.T) {
 	}
 }
 
+// The OpenAI translator drops an image it cannot inline, so validation must
+// refuse a remote image URL in any message, not only up to the first user turn.
+func TestValidateKiroRequestRejectsLaterOpenAIRemoteImage(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":"hello"},
+		{"role":"user","content":[{"type":"text","text":"see"},{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}
+	]}`)
+	if err := validateKiroRequest(body, body, sdktranslator.FormatOpenAI); err == nil {
+		t.Fatal("remote image URL in messages[2] accepted; the translator would drop it silently")
+	}
+}
+
 func TestNormalizeKiroToolsBoundsOpenAIFunctionDescription(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"run"}],"tools":[{"type":"function","function":{"name":"Workflow","description":"","parameters":{"type":"object"}}}]}`)
 	body, err := sjson.SetBytes(body, "tools.0.function.description", strings.Repeat("x", maxKiroToolDescriptionBytes+1))

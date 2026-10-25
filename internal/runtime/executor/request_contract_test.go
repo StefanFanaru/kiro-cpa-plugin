@@ -57,6 +57,25 @@ func TestFilterUnsupportedNativeToolsKeepsAnthropicFunctionTools(t *testing.T) {
 	}
 }
 
+func TestFilterUnsupportedNativeToolsKeepsAnthropicCustomTypeTools(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"x"}],"tools":[
+		{"type":"custom","name":"Read","description":"Read","input_schema":{"type":"object"}},
+		{"name":"Bash","description":"Bash","input_schema":{"type":"object"}},
+		{"type":"web_search_20250305","name":"web_search"}
+	]}`)
+	out, err := normalizeKiroRequest(body, sdktranslator.FormatClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tool := range gjson.GetBytes(out, "tools").Array() {
+		names = append(names, tool.Get("name").String())
+	}
+	if strings.Join(names, ",") != "Read,Bash" {
+		t.Fatalf("kept tools = %v, want [Read Bash]", names)
+	}
+}
+
 func TestFilterUnsupportedNativeToolsRemovesToolsFieldWhenNoneRemain(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`)
 

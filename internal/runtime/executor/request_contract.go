@@ -100,7 +100,9 @@ func normalizeKiroTools(body []byte, source sdktranslator.Format) ([]byte, error
 	changed := false
 	for _, tool := range tools.Array() {
 		toolType := strings.TrimSpace(tool.Get("type").String())
-		supported := toolType == ""
+		// Anthropic client tools may omit type or spell it "custom"; any other
+		// type names a server tool.
+		supported := toolType == "" || toolType == "custom"
 		if openAIChat {
 			supported = toolType == "function"
 		}

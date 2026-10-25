@@ -117,3 +117,51 @@ func TestBuildKiroPayloadReplaysSignedReasoningWithoutChangingIt(t *testing.T) {
 		t.Fatalf("assistant content = %q", assistant.Content)
 	}
 }
+
+func buildTestPayload(t *testing.T, body string) KiroPayload {
+	t.Helper()
+	raw, _ := BuildKiroPayload([]byte(body), "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	var payload KiroPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func TestBuildKiroPayloadKeepsToolResultImages(t *testing.T) {
+	t.Parallel()
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	image := `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + png + `"}}`
+	tools := `"tools":[{"name":"screenshot","description":"Capture","input_schema":{"type":"object"}}]`
+	turn := `{"role":"user","content":"Take a screenshot"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"screenshot","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"captured"},` + image + `]}]}`
+
+	current := buildTestPayload(t, `{"messages":[`+turn+`],`+tools+`}`).ConversationState.CurrentMessage.UserInputMessage
+	if len(current.Images) != 1 || current.Images[0].Format != "png" || current.Images[0].Source.Bytes != png {
+		t.Fatalf("current tool_result image = %#v", current.Images)
+	}
+	if got := current.UserInputMessageContext.ToolResults[0].Content; len(got) != 1 || got[0].Text != "captured" {
+		t.Fatalf("current tool_result text = %#v", got)
+	}
+
+	history := buildTestPayload(t, `{"messages":[`+turn+`,
+		{"role":"assistant","content":"done"},
+		{"role":"user","content":"again"}
+	],`+tools+`}`).ConversationState.History[2].UserInputMessage
+	if len(history.Images) != 1 || history.Images[0].Source.Bytes != png {
+		t.Fatalf("history tool_result image = %#v", history.Images)
+	}
+
+	imageOnly := buildTestPayload(t, `{"messages":[
+		{"role":"user","content":"Take a screenshot"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"screenshot","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[`+image+`]}]}
+	],`+tools+`}`).ConversationState.CurrentMessage.UserInputMessage
+	if len(imageOnly.Images) != 1 {
+		t.Fatalf("image-only tool_result image = %#v", imageOnly.Images)
+	}
+	if got := imageOnly.UserInputMessageContext.ToolResults[0].Content; len(got) != 1 || strings.TrimSpace(got[0].Text) == "" {
+		t.Fatalf("image-only tool_result text = %#v, want placeholder", got)
+	}
+}

@@ -56,3 +56,29 @@ func TestExceptionFrameFailsTheStream(t *testing.T) {
 		}
 	}
 }
+
+// CPA fails over to another credential only when the error arrives before the
+// first payload chunk. message_start went out before the event was looked at,
+// so an upstream error on the first frame reached the client as a stream that
+// had already started, and the request failed instead of moving on.
+func TestFirstFrameErrorIsTheFirstChunk(t *testing.T) {
+	t.Parallel()
+
+	bodies := map[string][]byte{
+		"exception frame": headerFrame("", stringHeader(":message-type", "exception"),
+			stringHeader(":exception-type", "ThrottlingException"), stringHeader(":error-message", "Too many requests")),
+	}
+	for _, eventType := range []string{"internalServerException", "exception", "error"} {
+		bodies[eventType] = kiroEvent(eventType, `{"message":"boom"}`)
+	}
+	for name, body := range bodies {
+		_, chunks := collectStream(t, body)
+		if len(chunks) == 0 || chunks[0].Err == nil {
+			first := "none"
+			if len(chunks) > 0 {
+				first = eventData(chunks[0].Payload).Get("type").String()
+			}
+			t.Errorf("%s: first chunk is %q, want the error", name, first)
+		}
+	}
+}

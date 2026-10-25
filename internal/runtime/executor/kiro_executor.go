@@ -2122,6 +2122,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 
 	contentBlockIndex := -1
 	messageStartSent := false
+	var messageStart []byte
 	isTextBlockOpen := false
 	var trace streamFrameTrace
 
@@ -2132,12 +2133,18 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 	// A frame with no payload and one whose payload is not JSON are both skipped
 	// before reaching the switch, so a stream made only of those used to close
 	// without ever opening.
+	// It is sent with the first output, not with the first event: CPA fails
+	// over to another credential only while no payload has reached the
+	// client, so an upstream error on the first frame must be the first chunk.
+	// The event is still built at the first event, with the usage known then.
 	emitMessageStart := func() {
 		if messageStartSent {
 			return
 		}
-		msgStart := kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
-		sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, msgStart, &translatorParam)
+		if messageStart == nil {
+			messageStart = kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
+		}
+		sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, messageStart, &translatorParam)
 		for _, chunk := range sseData {
 			if len(chunk) > 0 {
 				out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
@@ -2234,7 +2241,9 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			log.Debugf("kiro: streamToChannel found stopReason (top-level): %s", upstreamStopReason)
 		}
 
-		emitMessageStart()
+		if messageStart == nil {
+			messageStart = kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
+		}
 
 		switch eventType {
 		case "followupPromptEvent":
@@ -2342,6 +2351,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			return false
 
 		case "assistantResponseEvent":
+			emitMessageStart()
 			var contentDelta string
 			var toolUses []map[string]interface{}
 
@@ -2492,6 +2502,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			// they are never mistaken for visible text: buffering them until the
 			// signature left the client with no progress for the whole reasoning
 			// phase, and Claude Code abandons a stream that is silent for five minutes.
+			emitMessageStart()
 			var thinkingText string
 			var signature string
 			var redactedContent string
@@ -2618,6 +2629,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", toolErr.Error())}
 				return false
 			}
+			emitMessageStart()
 			currentToolUse = newState
 
 			// Input fragments are forwarded as they arrive: a large tool input

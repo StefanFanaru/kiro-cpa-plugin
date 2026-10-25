@@ -799,7 +799,7 @@ func loadUsageCredentialView(ctx context.Context, credential usageCredential, fo
 var errUsageTokenExpired = errors.New("kiro access token expired; waiting for CLIProxyAPI to refresh it")
 
 func fetchUsageForCredential(ctx context.Context, credential usageCredential) (usageAccountView, error) {
-	authRecord, raw, token := credential.authRecord, credential.raw, credential.token
+	authRecord, token := credential.authRecord, credential.token
 	label := kiroUsageLabel(token)
 	if accessTokenExpired(token, usageNow()) {
 		return usageAccountView{Label: label}, errUsageTokenExpired
@@ -809,8 +809,16 @@ func fetchUsageForCredential(ctx context.Context, credential usageCredential) (u
 		return usageAccountView{Label: label}, err
 	}
 	// The usage response is the only place AWS names the account, so a credential
-	// stored before this was read heals itself on the first page load.
-	if reconcileCredentialIdentity(ctx, authRecord.Name, raw, token, usage.UserInfo, usage.SubscriptionInfo.SubscriptionTitle) {
+	// stored before this was read heals itself on the first page load. The
+	// identity is merged into the document as stored now, read under the
+	// credential lock: the copy read before waiting on that lock can predate an
+	// auth.refresh, and saving it would put the old tokens back.
+	_, current, _, err := getHostKiroAuth(credential.entry.AuthIndex)
+	if err != nil {
+		log.Printf("kiro: re-read credential before saving its identity failed: %v", err)
+		current = nil
+	}
+	if reconcileCredentialIdentity(ctx, authRecord.Name, current, token, usage.UserInfo, usage.SubscriptionInfo.SubscriptionTitle) {
 		label = kiroUsageLabel(token)
 	}
 	account := usageView(label, usage, usageNow())

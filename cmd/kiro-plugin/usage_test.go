@@ -1071,6 +1071,73 @@ func TestReconcileCredentialIdentityPersistsOnlyIdentityFields(t *testing.T) {
 	}
 }
 
+// A usage read that waited on the credential lock behind auth.refresh must not
+// save the document it read before waiting: that would put the old tokens back.
+func TestUsageReconcileDoesNotRevertConcurrentRefresh(t *testing.T) {
+	originalHostCall, originalHTTPClient, originalNow, originalLister := usageHostCall, usageHTTPClient, usageNow, usageProfileLister
+	t.Cleanup(func() {
+		usageHostCall, usageHTTPClient, usageNow, usageProfileLister = originalHostCall, originalHTTPClient, originalNow, originalLister
+		resetUsageState()
+	})
+	resetUsageState()
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	usageNow = func() time.Time { return now }
+	usageProfileLister = func(context.Context, *http.Client, string, string) ([]availableProfile, error) { return nil, nil }
+	var mu sync.Mutex
+	store := map[string]any{
+		"type": "kiro", "authMethod": "builder-id", "region": "us-east-1", "clientIdHash": "lock-a2",
+		"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": now.Add(time.Hour).Format(time.RFC3339),
+	}
+	read := make(chan struct{}, 1)
+	usageHostCall = func(method string, request []byte) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return okEnvelope(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{{AuthIndex: "one", Name: "one.json", Provider: "kiro"}}})
+		case pluginabi.MethodHostAuthGet:
+			raw, _ := json.Marshal(store)
+			select {
+			case read <- struct{}{}:
+			default:
+			}
+			return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "one", Name: "one.json", JSON: raw})
+		case pluginabi.MethodHostAuthSave:
+			var save pluginapi.HostAuthSaveRequest
+			_ = json.Unmarshal(request, &save)
+			store = map[string]any{}
+			_ = json.Unmarshal(save.JSON, &store)
+			return okEnvelope(pluginapi.HostAuthSaveResponse{Name: save.Name})
+		}
+		return errorEnvelope("unexpected", method), nil
+	}
+	usageHTTPClient = func() httpDoer {
+		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
+			body := `{"userInfo":{"userId":"d-1.user"},"subscriptionInfo":{"subscriptionTitle":"KIRO PRO"},"usageBreakdownList":[]}`
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		})
+	}
+	lock := credentialUsageLock(&kiroauth.KiroTokenData{ClientIDHash: "lock-a2"}, "one")
+	lock.Lock() // auth.refresh in flight
+	done := make(chan struct{})
+	go func() { defer close(done); collectUsageAccounts(context.Background(), "") }()
+	<-read
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	store["accessToken"], store["refreshToken"] = "new-access", "new-refresh"
+	mu.Unlock()
+	lock.Unlock()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if store["refreshToken"] != "new-refresh" || store["accessToken"] != "new-access" {
+		t.Fatalf("usage reconcile reverted the refreshed token: accessToken=%v refreshToken=%v", store["accessToken"], store["refreshToken"])
+	}
+	if store["awsUserId"] != "d-1.user" {
+		t.Fatalf("identity was not persisted: %v", store)
+	}
+}
+
 // A real address reported by AWS replaces a synthetic one; nothing is written
 // when the response adds nothing new.
 func TestReconcileCredentialIdentityAdoptsRealEmailAndSkipsNoOpSaves(t *testing.T) {

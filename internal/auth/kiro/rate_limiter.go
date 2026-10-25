@@ -56,13 +56,23 @@ func NewRateLimiter() *RateLimiter {
 // NewRateLimiterWithConfig returns a limiter with cfg applied over the defaults.
 func NewRateLimiterWithConfig(cfg RateLimiterConfig) *RateLimiter {
 	rl := &RateLimiter{
-		states:           make(map[string]*tokenState),
-		minTokenInterval: DefaultMinTokenInterval,
-		maxTokenInterval: DefaultMaxTokenInterval,
-		jitterPercent:    DefaultJitterPercent,
-		suspendCooldown:  DefaultSuspendCooldown,
-		rng:              rand.New(rand.NewSource(time.Now().UnixNano())),
+		states:        make(map[string]*tokenState),
+		jitterPercent: DefaultJitterPercent,
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
+	rl.Configure(cfg)
+	return rl
+}
+
+// Configure applies cfg over the defaults in place. Per-credential pacing and
+// out-of-rotation state survive, so a host reconfigure neither lets a burst
+// through nor puts a parked credential back into rotation.
+func (rl *RateLimiter) Configure(cfg RateLimiterConfig) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.minTokenInterval = DefaultMinTokenInterval
+	rl.maxTokenInterval = DefaultMaxTokenInterval
+	rl.suspendCooldown = DefaultSuspendCooldown
 	if cfg.MinTokenInterval > 0 {
 		rl.minTokenInterval = cfg.MinTokenInterval
 	}
@@ -72,7 +82,6 @@ func NewRateLimiterWithConfig(cfg RateLimiterConfig) *RateLimiter {
 	if cfg.SuspendCooldown > 0 {
 		rl.suspendCooldown = cfg.SuspendCooldown
 	}
-	return rl
 }
 
 func (rl *RateLimiter) state(tokenKey string) *tokenState {
@@ -132,7 +141,10 @@ func (rl *RateLimiter) MarkUnavailable(tokenKey, reason string, window time.Dura
 
 // MarkSuspended applies the configured suspension cooldown to the credential.
 func (rl *RateLimiter) MarkSuspended(tokenKey string) {
-	rl.MarkUnavailable(tokenKey, ReasonSuspended, rl.suspendCooldown)
+	rl.mu.Lock()
+	cooldown := rl.suspendCooldown
+	rl.mu.Unlock()
+	rl.MarkUnavailable(tokenKey, ReasonSuspended, cooldown)
 }
 
 // TokenUnavailable reports why a credential is out of rotation and for how

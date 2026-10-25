@@ -83,6 +83,29 @@ func TestFirstFrameErrorIsTheFirstChunk(t *testing.T) {
 	}
 }
 
+// An empty assistant or reasoning delta sent message_start too. An
+// upstream error after it was then no longer the first chunk, and CPA did not
+// fail over.
+func TestEmptyFirstEventKeepsErrorFirst(t *testing.T) {
+	t.Parallel()
+
+	exception := headerFrame("", stringHeader(":message-type", "exception"),
+		stringHeader(":exception-type", "ThrottlingException"), stringHeader(":error-message", "Too many requests"))
+	for name, empty := range map[string][]byte{
+		"assistant": kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":""}}`),
+		"reasoning": kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"text":""}}`),
+	} {
+		_, chunks := collectStream(t, kiroEventStream(empty, exception))
+		if len(chunks) == 0 || chunks[0].Err == nil {
+			first := "none"
+			if len(chunks) > 0 {
+				first = eventData(chunks[0].Payload).Get("type").String()
+			}
+			t.Errorf("%s: first chunk is %q, want the error", name, first)
+		}
+	}
+}
+
 // Text or reasoning that arrives while a tool_use block is open would open a
 // second block before the first is closed, and the remaining input fragments
 // would go to the wrong index. Kiro has not been seen doing this, so the

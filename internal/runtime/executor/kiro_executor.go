@@ -2391,6 +2391,12 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 				}
 			}
 
+			// Text inside an open tool_use block would corrupt the block indexes.
+			if currentToolUse != nil && (contentDelta != "" || len(toolUses) > 0) {
+				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", fmt.Sprintf("text arrived during tool call %q", aliases.original(currentToolUse.Name)))}
+				return false
+			}
+
 			// Assistant response events are text. Reasoning is emitted only from the
 			// dedicated reasoningContentEvent below; textual tags are never reinterpreted.
 			if contentDelta != "" || len(toolUses) > 0 {
@@ -2528,6 +2534,11 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 				if redacted, ok := event["redactedContent"].(string); ok {
 					redactedContent = redacted
 				}
+			}
+
+			if currentToolUse != nil && (thinkingText != "" || signature != "" || redactedContent != "") {
+				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", fmt.Sprintf("reasoning arrived during tool call %q", aliases.original(currentToolUse.Name)))}
+				return false
 			}
 
 			if thinkingText != "" || (signature != "" && redactedContent == "") {

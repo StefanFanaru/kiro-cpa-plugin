@@ -34,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -500,7 +501,7 @@ func normalizeKiroPayloadMaxTokens(payload []byte, capability modelcapabilities.
 	return updated
 }
 
-func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *cliproxyexecutor.Options) error {
+func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, payload []byte, opts *cliproxyexecutor.Options) error {
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
 	}
@@ -510,11 +511,19 @@ func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *clipr
 	}
 	opts.Metadata["_kiro_auth_id"] = authID
 	requested, _ := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey].(string)
+	if requested == "" && opts.SourceFormat.String() == "claude" {
+		// CPA before 8.0.42 resolves the effort metadata from reasoning_effort,
+		// reasoning.effort, thinking budgets and model suffixes, but not from an
+		// Anthropic request's own output_config.effort, so that level never
+		// reached Kiro. The host's value still wins whenever it set one.
+		requested = gjson.GetBytes(payload, "output_config.effort").String()
+	}
 	// Reasoning effort is an optional enrichment, so a request is never refused
 	// over it: the effort is fitted to what the selected account's schema for
 	// this model accepts, and any change is logged. A model with no schema at
-	// all (every Builder ID model measured on 2026-09-13) simply carries no
-	// effort field, which is also what happens for "auto".
+	// all (on 2026-10-25, claude-haiku-4.5 and claude-sonnet-4.5 among the nine
+	// Builder ID models) simply carries no effort field, which is also what
+	// happens for "auto".
 	capability, _ := modelcapabilities.ForAuth(authID, modelID)
 	effort, note := capability.ResolveEffort(requested)
 	if note != "" {
@@ -764,7 +773,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 
 	kiroModelID := e.mapModelToKiro(req.Model)
-	if err := prepareModelCapability(auth, kiroModelID, &opts); err != nil {
+	if err := prepareModelCapability(auth, kiroModelID, req.Payload, &opts); err != nil {
 		return resp, err
 	}
 
@@ -1025,7 +1034,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	kiroModelID := e.mapModelToKiro(req.Model)
-	if err := prepareModelCapability(auth, kiroModelID, &opts); err != nil {
+	if err := prepareModelCapability(auth, kiroModelID, req.Payload, &opts); err != nil {
 		return nil, err
 	}
 

@@ -43,7 +43,7 @@ func TestParseEventStreamAccumulatesFragmentedSignedReasoning(t *testing.T) {
 	}
 }
 
-func TestStreamBuffersReasoningUntilSignatureAndKeepsItOutOfVisibleText(t *testing.T) {
+func TestStreamKeepsSignedReasoningOutOfVisibleText(t *testing.T) {
 	t.Parallel()
 
 	body := kiroEventStream(
@@ -90,6 +90,44 @@ func TestStreamBuffersReasoningUntilSignatureAndKeepsItOutOfVisibleText(t *testi
 	}
 	if strings.Index(strings.Join(deltaTypes, ","), "thinking_delta") > strings.Index(strings.Join(deltaTypes, ","), "signature_delta") {
 		t.Fatalf("signature preceded thinking: %v", deltaTypes)
+	}
+}
+
+// Kiro signs reasoning only after its last fragment, which can be minutes
+// later. Holding the fragments until then left the client with message_start
+// and nothing else, and Claude Code abandons a stream silent for five minutes.
+func TestStreamForwardsReasoningBeforeItsSignature(t *testing.T) {
+	t.Parallel()
+
+	upstream, writer := io.Pipe()
+	defer upstream.Close()
+	out := make(chan cliproxyexecutor.StreamChunk, 32)
+	go func() {
+		defer close(out)
+		(&KiroExecutor{}).streamToChannel(context.Background(), upstream, out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0)
+	}()
+	go func() {
+		_, _ = writer.Write(kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"text":"first thought"}}`))
+	}()
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case chunk := <-out:
+			if chunk.Err != nil {
+				t.Fatal(chunk.Err)
+			}
+			data := eventData(chunk.Payload)
+			if data.Get("delta.type").String() == "thinking_delta" {
+				if got := data.Get("delta.thinking").String(); got != "first thought" {
+					t.Fatalf("thinking = %q", got)
+				}
+				_ = writer.Close()
+				return
+			}
+		case <-timeout:
+			t.Fatal("no thinking_delta reached the client before the signature")
+		}
 	}
 }
 

@@ -382,19 +382,29 @@ func normalizeOrigin(origin string) string {
 	}
 }
 
+// claudeBillingHeaderPrefix starts the system block in which Claude Code sends
+// a per-request billing fingerprint. It means nothing to Kiro and, because
+// instructions lead history[0], would change Kiro's cached prefix whenever the
+// fingerprint changes.
+const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
+
 // extractSystemPrompt extracts system prompt from Claude request
 func extractSystemPrompt(claudeBody []byte) string {
 	systemField := gjson.GetBytes(claudeBody, "system")
 	if systemField.IsArray() {
-		var sb strings.Builder
+		var parts []string
 		for _, block := range systemField.Array() {
+			text := ""
 			if block.Get("type").String() == "text" {
-				sb.WriteString(block.Get("text").String())
+				text = block.Get("text").String()
 			} else if block.Type == gjson.String {
-				sb.WriteString(block.String())
+				text = block.String()
+			}
+			if text != "" && !strings.HasPrefix(text, claudeBillingHeaderPrefix) {
+				parts = append(parts, text)
 			}
 		}
-		return sb.String()
+		return strings.Join(parts, "\n\n")
 	}
 	return systemField.String()
 }
@@ -479,7 +489,7 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 // BuildUserMessageStruct builds a user message and extracts tool results
 func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserInputMessage, []KiroToolResult) {
 	content := msg.Get("content")
-	var contentBuilder strings.Builder
+	var texts []string
 	var toolResults []KiroToolResult
 	var images []KiroImage
 
@@ -488,7 +498,7 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 			partType := part.Get("type").String()
 			switch partType {
 			case "text":
-				contentBuilder.WriteString(part.Get("text").String())
+				texts = append(texts, part.Get("text").String())
 			case "image":
 				if image, ok := kiroImageFromClaudeBlock(part); ok {
 					images = append(images, image)
@@ -540,11 +550,11 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 			}
 		}
 	} else {
-		contentBuilder.WriteString(content.String())
+		texts = append(texts, content.String())
 	}
 
 	userMsg := KiroUserInputMessage{
-		Content: contentBuilder.String(),
+		Content: joinTextBlocks(texts),
 		ModelID: modelID,
 		Origin:  origin,
 	}
@@ -554,6 +564,13 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 	}
 
 	return userMsg, toolResults
+}
+
+// joinTextBlocks joins a message's text blocks with the newline
+// kirocommon.MergeAdjacentMessages puts between merged messages, so text
+// renders the same whether it arrived as blocks or as adjacent messages.
+func joinTextBlocks(texts []string) string {
+	return strings.Join(texts, "\n")
 }
 
 // toolResultImagePlaceholder stands in for a tool result whose only content is
@@ -579,7 +596,7 @@ func kiroImageFromClaudeBlock(part gjson.Result) (KiroImage, bool) {
 // BuildAssistantMessageStruct builds an assistant message with tool uses
 func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage {
 	content := msg.Get("content")
-	var contentBuilder strings.Builder
+	var texts []string
 	var toolUses []KiroToolUse
 	var reasoningText string
 	var reasoningSignature string
@@ -590,7 +607,7 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 			partType := part.Get("type").String()
 			switch partType {
 			case "text":
-				contentBuilder.WriteString(part.Get("text").String())
+				texts = append(texts, part.Get("text").String())
 			case "thinking":
 				// A signature covers its own block's text only, so joined
 				// texts under one signature never verify. Kiro replays one
@@ -621,13 +638,13 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 			}
 		}
 	} else {
-		contentBuilder.WriteString(content.String())
+		texts = append(texts, content.String())
 	}
 
 	// Kiro's AssistantResponseMessage requires the content field, but the official
 	// client sends an empty string when a turn contains only tool uses. Inventing
 	// visible filler here pollutes the conversation and can be echoed by the model.
-	finalContent := contentBuilder.String()
+	finalContent := joinTextBlocks(texts)
 	var reasoningContent *KiroReasoningContent
 	if redactedContent != "" {
 		reasoningContent = &KiroReasoningContent{RedactedContent: redactedContent}

@@ -2589,18 +2589,19 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			}
 			pendingReasoning.Reset()
 
-			completedToolUses, newState, toolErr := kiroclaude.ProcessToolUseEvent(event, currentToolUse, processedIDs)
+			step, newState, toolErr := kiroclaude.StreamToolUseEvent(event, currentToolUse, processedIDs)
 			if toolErr != nil {
 				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", toolErr.Error())}
 				return false
 			}
 			currentToolUse = newState
 
-			// Emit completed tool uses
-			for _, tu := range completedToolUses {
-				hasToolUses = true
+			// Input fragments are forwarded as they arrive: a large tool input
+			// otherwise leaves the client without an event until it is complete.
+			if step.Started {
 				outputForUsage.WriteString("\n")
-				outputForUsage.WriteString(tu.Name)
+				outputForUsage.WriteString(step.Name)
+				outputForUsage.WriteString("\n")
 
 				// Close text block if open
 				if isTextBlockOpen && contentBlockIndex >= 0 {
@@ -2616,33 +2617,30 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 
 				contentBlockIndex++
 
-				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", tu.ToolUseID, aliases.original(tu.Name))
+				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", step.ToolUseID, aliases.original(step.Name))
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 				for _, chunk := range sseData {
 					if len(chunk) > 0 {
 						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
 					}
 				}
+			}
 
-				if tu.Input != nil {
-					inputJSON, err := json.Marshal(tu.Input)
-					if err != nil {
-						log.Debugf("kiro: failed to marshal tool input in toolUseEvent: %v", err)
-					} else {
-						outputForUsage.WriteString("\n")
-						outputForUsage.Write(inputJSON)
-						inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputJSON), contentBlockIndex)
-						sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
-						for _, chunk := range sseData {
-							if len(chunk) > 0 {
-								out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
-							}
-						}
+			if step.Fragment != "" {
+				outputForUsage.WriteString(step.Fragment)
+				inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(step.Fragment, contentBlockIndex)
+				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
+				for _, chunk := range sseData {
+					if len(chunk) > 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
 					}
 				}
+			}
 
+			if step.Completed != nil {
+				hasToolUses = true
 				blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
-				sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
+				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 				for _, chunk := range sseData {
 					if len(chunk) > 0 {
 						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}

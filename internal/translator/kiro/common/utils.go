@@ -1,7 +1,12 @@
 // Package common provides shared constants and utilities for Kiro translator.
 package common
 
-import "strings"
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+)
 
 // GetString safely extracts a string from a map.
 // Returns empty string if the key doesn't exist or the value is not a string.
@@ -38,3 +43,21 @@ func PrependInstructions(content, instructions string) string {
 // alongside SPEC and AUTOPILOT. The header was measured to be case-insensitive,
 // but the body field is a modelled enum, so the canonical spelling is used.
 const AgentModeVibe = "VIBE"
+
+// DecodeToolInput decodes a tool input JSON object for replay to Kiro. Numbers
+// decode as json.Number, so integers beyond float64 precision (ids, hashes)
+// re-encode unchanged; everything else decodes as json.Unmarshal would, so
+// re-encoding sorts keys and escapes strings exactly as before. Like
+// json.Unmarshal, JSON null yields a nil map and no error.
+func DecodeToolInput(raw string) (map[string]interface{}, error) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var input map[string]interface{}
+	if err := decoder.Decode(&input); err != nil {
+		return nil, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, errors.New("tool input has data after the JSON value")
+	}
+	return input, nil
+}

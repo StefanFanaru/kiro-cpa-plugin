@@ -681,12 +681,12 @@ func buildAssistantMessageFromOpenAI(msg gjson.Result) KiroAssistantResponseMess
 				toolName := part.Get("name").String()
 				inputData := part.Get("input")
 
-				inputMap := make(map[string]interface{})
+				var inputMap map[string]interface{}
 				if inputData.Exists() && inputData.IsObject() {
-					inputData.ForEach(func(key, value gjson.Result) bool {
-						inputMap[key.String()] = value.Value()
-						return true
-					})
+					inputMap, _ = kirocommon.DecodeToolInput(inputData.Raw)
+				}
+				if inputMap == nil {
+					inputMap = make(map[string]interface{})
 				}
 
 				toolUses = append(toolUses, KiroToolUse{
@@ -714,8 +714,8 @@ func buildAssistantMessageFromOpenAI(msg gjson.Result) KiroAssistantResponseMess
 			// Kiro's input is an object; a missing, empty or truncated argument
 			// string (a client replaying an interrupted stream) must replay as {}
 			// rather than null.
-			inputMap := make(map[string]interface{})
-			if err := json.Unmarshal([]byte(toolArgs), &inputMap); err != nil || inputMap == nil {
+			inputMap, err := kirocommon.DecodeToolInput(toolArgs)
+			if err != nil || inputMap == nil {
 				if err != nil {
 					log.Warnf("kiro-openai: tool call %s carried undecodable arguments; replaying with empty input", toolName)
 				}

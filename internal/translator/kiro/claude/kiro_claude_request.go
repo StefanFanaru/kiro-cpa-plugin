@@ -607,11 +607,7 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 
 				var inputMap map[string]interface{}
 				if toolInput.IsObject() {
-					inputMap = make(map[string]interface{})
-					toolInput.ForEach(func(key, value gjson.Result) bool {
-						inputMap[key.String()] = value.Value()
-						return true
-					})
+					inputMap, _ = kirocommon.DecodeToolInput(toolInput.Raw)
 				}
 
 				toolUses = append(toolUses, KiroToolUse{

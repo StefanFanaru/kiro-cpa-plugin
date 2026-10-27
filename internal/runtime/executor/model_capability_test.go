@@ -2,7 +2,11 @@ package executor
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
 	"testing"
+
+	"github.com/tidwall/gjson"
 
 	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -35,7 +39,7 @@ func TestPrepareModelCapabilityAllowsClientMaxTokens(t *testing.T) {
 		SourceFormat:    sdktranslator.FromString("openai-response"),
 		OriginalRequest: []byte(`{"max_output_tokens":512}`),
 	}
-	if err := prepareModelCapability(auth, "claude-opus-5", &opts); err != nil {
+	if err := prepareModelCapability(auth, "claude-opus-5", nil, &opts); err != nil {
 		t.Fatalf("client max_output_tokens was rejected by plugin: %v", err)
 	}
 }
@@ -47,7 +51,7 @@ func TestPrepareModelCapabilityClampsUnsupportedEffort(t *testing.T) {
 		EffortLevels: []string{"low", "high"},
 	}})
 	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.ReasoningEffortMetadataKey: "max"}}
-	if err := prepareModelCapability(auth, "claude-opus-5", &opts); err != nil {
+	if err := prepareModelCapability(auth, "claude-opus-5", nil, &opts); err != nil {
 		t.Fatalf("an effort above the schema's range was rejected instead of clamped: %v", err)
 	}
 	if got := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]; got != "high" {
@@ -56,9 +60,9 @@ func TestPrepareModelCapabilityClampsUnsupportedEffort(t *testing.T) {
 }
 
 // Claude Code sends thinking:{type:"enabled"} without a budget, which CPA
-// reports as effort "auto". Measured on 2026-09-13, none of the nine Builder ID
-// models publishes an effort schema, so both cases must degrade to "no effort
-// field" rather than fail the request.
+// reports as effort "auto". A model without an effort schema (on 2026-10-25,
+// claude-haiku-4.5 and claude-sonnet-4.5 among the nine Builder ID models) must
+// degrade to "no effort field" rather than fail the request.
 func TestPrepareModelCapabilityNeverRejectsOverEffort(t *testing.T) {
 	withSchema := &cliproxyauth.Auth{ID: "auth-auto-effort"}
 	modelcapabilities.ReplaceForAuth(withSchema.ID, []modelcapabilities.Capability{{
@@ -85,7 +89,7 @@ func TestPrepareModelCapabilityNeverRejectsOverEffort(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.ReasoningEffortMetadataKey: test.requested}}
-			if err := prepareModelCapability(test.auth, "claude-opus-5", &opts); err != nil {
+			if err := prepareModelCapability(test.auth, "claude-opus-5", nil, &opts); err != nil {
 				t.Fatalf("request rejected over reasoning effort: %v", err)
 			}
 			got, exists := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]
@@ -106,7 +110,7 @@ func TestPrepareModelCapabilityTreatsDisabledAsNoEffort(t *testing.T) {
 		EffortLevels: []string{"low", "medium", "high"},
 	}})
 	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.ReasoningEffortMetadataKey: "none"}}
-	if err := prepareModelCapability(auth, "claude-opus-5", &opts); err != nil {
+	if err := prepareModelCapability(auth, "claude-opus-5", nil, &opts); err != nil {
 		t.Fatalf("disabled thinking was rejected: %v", err)
 	}
 	if _, exists := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]; exists {
@@ -243,6 +247,77 @@ func TestNormalizeKiroPayloadDropsAnUnusableBudget(t *testing.T) {
 		}
 		if _, exists := fields["output_config"]; !exists {
 			t.Fatalf("the effort field was collateral damage: %s", updated)
+		}
+	}
+}
+
+// CPA before 8.0.42 leaves the effort metadata empty for an Anthropic request
+// that sets output_config.effort itself, so the plugin reads it from the body.
+func TestPrepareModelCapabilityReadsClaudeOutputConfigEffort(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "auth-claude-body-effort"}
+	modelcapabilities.ReplaceForAuth(auth.ID, []modelcapabilities.Capability{{
+		ModelID: "claude-opus-5", EffortPath: modelcapabilities.EffortPathOutputConfig,
+		EffortLevels: []string{"low", "medium", "high"},
+	}})
+	body := []byte(`{"model":"claude-opus-5","output_config":{"effort":"high"},"messages":[]}`)
+	for _, test := range []struct {
+		name     string
+		format   string
+		body     []byte
+		metadata string
+		want     any
+	}{
+		{"claude body without metadata", "claude", body, "", "high"},
+		{"claude body above the schema is clamped", "claude", []byte(`{"output_config":{"effort":"max"}}`), "", "high"},
+		{"host metadata wins over the body", "claude", body, "low", "low"},
+		{"claude body without an effort", "claude", []byte(`{"messages":[]}`), "", nil},
+		{"other formats ignore the body", "openai", body, "", nil},
+		{"responses requests ignore the body", "openai-response", body, "", nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString(test.format), Metadata: map[string]any{}}
+			if test.metadata != "" {
+				opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey] = test.metadata
+			}
+			if err := prepareModelCapability(auth, "claude-opus-5", test.body, &opts); err != nil {
+				t.Fatal(err)
+			}
+			got, exists := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]
+			if test.want == nil && exists {
+				t.Fatalf("effort metadata = %#v, want it omitted", got)
+			}
+			if test.want != nil && got != test.want {
+				t.Fatalf("effort metadata = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+// The effort read from an Anthropic body must reach the payload sent to Kiro
+// through both entry points, not only the helper.
+func TestClaudeOutputConfigEffortReachesKiro(t *testing.T) {
+	var sent []byte
+	stubUpstream(t, func(request *http.Request) (*http.Response, error) {
+		sent, _ = io.ReadAll(request.Body)
+		return upstreamStatus(http.StatusBadRequest, nil, `{"message":"stop"}`), nil
+	})
+	body := []byte(`{"model":"claude-opus-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"high"}}`)
+	for _, stream := range []bool{false, true} {
+		auth := builderIDAuth("auth-claude-effort-e2e")
+		modelcapabilities.ReplaceForAuth(auth.ID, []modelcapabilities.Capability{{
+			ModelID: "claude-opus-5", EffortPath: modelcapabilities.EffortPathOutputConfig,
+			EffortLevels: []string{"low", "medium", "high"}, SchemaObserved: true,
+		}})
+		sent = nil
+		request := cliproxyexecutor.Request{Model: "claude-opus-5", Payload: body, Format: sdktranslator.FromString("claude")}
+		options := cliproxyexecutor.Options{Stream: stream, SourceFormat: sdktranslator.FromString("claude"), OriginalRequest: body, Metadata: map[string]any{}}
+		if stream {
+			_, _ = NewKiroExecutor(nil).ExecuteStream(t.Context(), auth, request, options)
+		} else {
+			_, _ = NewKiroExecutor(nil).Execute(t.Context(), auth, request, options)
+		}
+		if got := gjson.GetBytes(sent, "additionalModelRequestFields.output_config.effort").String(); got != "high" {
+			t.Fatalf("stream=%v: Kiro received output_config.effort %q, want high; payload %s", stream, got, sent)
 		}
 	}
 }

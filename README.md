@@ -13,7 +13,7 @@ The plugin:
 - supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages;
 - supports streaming, tool calls, token refresh, multiple accounts, and failover;
 - forwards client-executed function tools, bounds their descriptions to Kiro's upstream limit, and omits server-side tools that Kiro cannot execute;
-- preserves system and developer instructions exactly once, anchored to the first user turn, because the upstream `systemPrompt` field is feature-gated;
+- preserves system and developer instructions exactly once as user text, because the upstream `systemPrompt` field is feature-gated;
 - provides a read-only `Kiro Usage` page for subscription usage, with per-account reload.
 
 `Kiro` is the name shown in the CLIProxyAPI interface. The provider ID stays `kiro`; the plugin ID, library filename, and `plugins.configs` key are `kiro-ha` (see [Build](#build)).
@@ -94,6 +94,8 @@ The plugin stores credentials through the CLIProxyAPI authentication mechanism. 
 CPA owns credential selection, failover and the 429 backoff ladder; the plugin returns status-aware errors (429/402/403/401), also for an error in the middle of a stream, and forwards an upstream `Retry-After` when Kiro sends one; CPA 8.0.42 and later cool a 429 for exactly that long. The plugin keeps only the protection CPA cannot provide: it paces requests per credential (`min_token_interval`/`max_token_interval`, default 1–2s with jitter), remembers a 402 monthly limit until the next UTC day, and takes a credential Kiro reports as suspended out of rotation for `suspend_cooldown` (default 1h). While a credential is parked it is refused with 402 (monthly limit) or 403 (suspended) rather than 429: CPA before 8.0.42 cannot read the plugin's retry-after, and CPA cools 402 and 403 for 30 minutes on every version, so they make it fail over instead of retrying the credential within seconds. These settings, like `login_base_url`, live under `plugins.configs.kiro-ha`; a credential with `disable_cooling: true` opts out of all of them.
 
 ## Model capabilities
+
+For Anthropic Messages, the top-level `system` text is prepended to the first user turn. Inline `system` messages stay at their original position as user text and merge with adjacent user turns. A request ending in a nonempty inline `system` message sends that text in Kiro's current user message, merged with the preceding turn if it is also a user message. Earlier history stays unchanged.
 
 Reasoning controls are advertised only when the authenticated account's Kiro model schema declares an `effort` enum. Claude models currently use `additionalModelRequestFields.output_config.effort`; GPT models use `additionalModelRequestFields.reasoning.effort`. The plugin forwards the selected level through that declared path for OpenAI Responses, Chat Completions, and Anthropic Messages.
 

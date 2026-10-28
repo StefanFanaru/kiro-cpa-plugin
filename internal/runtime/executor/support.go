@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"strings"
@@ -40,13 +41,8 @@ func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e upstreamTransportErr) Error() string {
 	return "Kiro upstream connection failed: " + e.cause.Error()
 }
-func (e upstreamTransportErr) Unwrap() error { return e.cause }
-
-// StatusCode is 0: a transport failure belongs to the connection, which every
-// credential on the transport shares, not to the credential. CPA cools a
-// credential for any 408 or 5xx; with no status it decides from the message,
-// which keeps the cause text for that.
-func (e upstreamTransportErr) StatusCode() int { return 0 }
+func (e upstreamTransportErr) Unwrap() error   { return e.cause }
+func (e upstreamTransportErr) StatusCode() int { return http.StatusBadGateway }
 
 // upstreamIdleTimeout bounds the silence between two reads of an upstream
 // body. It is not a cap on the answer's length: every read that returns data
@@ -54,7 +50,7 @@ func (e upstreamTransportErr) StatusCode() int { return 0 }
 var upstreamIdleTimeout = 5 * time.Minute
 
 // upstreamIdleErr reports a body that delivered nothing for the idle limit.
-// It is a net.Error timeout, and its text names it as one for the host.
+// It is a net.Error timeout, so it is classified like any other read timeout.
 type upstreamIdleErr struct{ idle time.Duration }
 
 func (e upstreamIdleErr) Error() string {
@@ -140,8 +136,13 @@ func normalizeTransportError(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return statusErr{code: 499, msg: "client canceled request"}
 	}
-	// Timeouts included: a silent connection or a missed header deadline is
-	// no more the credential's fault than a reset.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
+	}
 	return upstreamTransportErr{cause: err}
 }
 

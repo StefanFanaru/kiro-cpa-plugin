@@ -844,6 +844,13 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				return resp, statusErr{code: 499, msg: "client canceled request"}
 			}
 
+			// Check for context deadline exceeded - request timed out
+			// Return 504 Gateway Timeout instead of 500
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Debugf("kiro: request timed out (context.DeadlineExceeded)")
+				return resp, statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
+			}
+
 			recordAPIResponseError(ctx, e.cfg, err)
 
 			// Only a request that never left is retried: once it was written,
@@ -1348,8 +1355,8 @@ func (e *EventStreamError) Error() string {
 	return fmt.Sprintf("event stream %s: %s", e.Type, e.Message)
 }
 
-// Unwrap exposes the read error, so a cancellation is classified as one
-// rather than as a connection failure.
+// Unwrap exposes the read error, so a timeout or cancellation is classified
+// as one rather than as a generic connection failure.
 func (e *EventStreamError) Unwrap() error { return e.Cause }
 
 // eventStreamMessage represents a parsed AWS Event Stream message

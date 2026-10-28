@@ -77,94 +77,21 @@ const (
 	kiroSocketMaxRetryDelay  = 30 * time.Second
 )
 
-// retryableErrorPatterns are transport error messages worth a second attempt,
-// matched against the lowercased error text.
-var retryableErrorPatterns = []string{
-	"connection reset",
-	"connection refused",
-	"broken pipe",
-	"timeout",
-	"temporary failure",
-	"no such host",
-	"network is unreachable",
-	"i/o timeout",
-}
-
-// isRetryableError checks if an error is retryable based on error type and message.
-// Returns true for network timeouts, connection resets, and temporary failures.
-// Based on kiro2Api's retry logic patterns.
+// isRetryableError recognizes transport error values, independent of OS error text.
 func isRetryableError(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-
-	// Check for context cancellation - not retryable
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-
-	// Check for net.Error (timeout, temporary)
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		if netErr.Timeout() {
-			log.Debugf("kiro: isRetryableError: network timeout detected")
-			return true
-		}
-		// Note: Temporary() is deprecated but still useful for some error types
-	}
-
-	// Check for specific syscall errors (connection reset, broken pipe, etc.)
-	var syscallErr syscall.Errno
-	if errors.As(err, &syscallErr) {
-		switch syscallErr {
-		case syscall.ECONNRESET: // Connection reset by peer
-			log.Debugf("kiro: isRetryableError: ECONNRESET detected")
-			return true
-		case syscall.ECONNREFUSED: // Connection refused
-			log.Debugf("kiro: isRetryableError: ECONNREFUSED detected")
-			return true
-		case syscall.EPIPE: // Broken pipe
-			log.Debugf("kiro: isRetryableError: EPIPE (broken pipe) detected")
-			return true
-		case syscall.ETIMEDOUT: // Connection timed out
-			log.Debugf("kiro: isRetryableError: ETIMEDOUT detected")
-			return true
-		case syscall.ENETUNREACH: // Network is unreachable
-			log.Debugf("kiro: isRetryableError: ENETUNREACH detected")
-			return true
-		case syscall.EHOSTUNREACH: // No route to host
-			log.Debugf("kiro: isRetryableError: EHOSTUNREACH detected")
-			return true
-		}
-	}
-
-	// Check for net.OpError wrapping other errors
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		log.Debugf("kiro: isRetryableError: net.OpError detected, op=%s", opErr.Op)
-		// Recursively check the wrapped error
-		if opErr.Err != nil {
-			return isRetryableError(opErr.Err)
-		}
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
 		return true
 	}
-
-	// Check error message for retryable patterns
-	errMsg := strings.ToLower(err.Error())
-	for _, pattern := range retryableErrorPatterns {
-		if strings.Contains(errMsg, pattern) {
-			log.Debugf("kiro: isRetryableError: pattern '%s' matched in error: %s", pattern, errMsg)
+	for _, cause := range []error{syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.EPIPE, syscall.ETIMEDOUT, syscall.ENETUNREACH, syscall.EHOSTUNREACH, io.EOF, io.ErrUnexpectedEOF} {
+		if errors.Is(err, cause) {
 			return true
 		}
 	}
-
-	// Check for EOF which may indicate connection was closed
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		log.Debugf("kiro: isRetryableError: EOF/UnexpectedEOF detected")
-		return true
-	}
-
-	return false
+	return isRetryablePlatformSocketError(err)
 }
 
 // calculateRetryDelay is the wait before retrying the same request. Tests

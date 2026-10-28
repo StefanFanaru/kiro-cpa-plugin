@@ -46,7 +46,8 @@ func (e upstreamTransportErr) StatusCode() int { return http.StatusBadGateway }
 
 // upstreamIdleTimeout bounds the silence between two reads of an upstream
 // body. It is not a cap on the answer's length: every read that returns data
-// restarts it. Tests shorten it.
+// restarts it. Five minutes is an initial estimate, not a measured upstream
+// limit. Tests shorten it.
 var upstreamIdleTimeout = 5 * time.Minute
 
 // upstreamIdleErr reports a body that delivered nothing for the idle limit.

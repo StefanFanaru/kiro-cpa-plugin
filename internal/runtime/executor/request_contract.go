@@ -7,6 +7,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	kirocommon "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/common"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -217,10 +218,10 @@ func claudeSystemTextParts(content gjson.Result) ([]string, error) {
 		return nil, nil
 	}
 	if content.Type == gjson.String {
-		if content.String() == "" {
+		if kirocommon.StripClaudeBillingHeader(content.String()) == "" {
 			return nil, nil
 		}
-		return []string{content.String()}, nil
+		return []string{kirocommon.StripClaudeBillingHeader(content.String())}, nil
 	}
 	if !content.IsArray() {
 		return nil, fmt.Errorf("Kiro supports only text in Anthropic system messages")
@@ -228,16 +229,16 @@ func claudeSystemTextParts(content gjson.Result) ([]string, error) {
 	parts := make([]string, 0, len(content.Array()))
 	for _, block := range content.Array() {
 		if block.Type == gjson.String {
-			if block.String() != "" {
-				parts = append(parts, block.String())
+			if kirocommon.StripClaudeBillingHeader(block.String()) != "" {
+				parts = append(parts, kirocommon.StripClaudeBillingHeader(block.String()))
 			}
 			continue
 		}
 		if block.Get("type").String() != "text" {
 			return nil, fmt.Errorf("Kiro supports only text in Anthropic system messages")
 		}
-		if block.Get("text").String() != "" {
-			parts = append(parts, block.Get("text").String())
+		if kirocommon.StripClaudeBillingHeader(block.Get("text").String()) != "" {
+			parts = append(parts, kirocommon.StripClaudeBillingHeader(block.Get("text").String()))
 		}
 	}
 	return parts, nil

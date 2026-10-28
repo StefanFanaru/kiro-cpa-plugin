@@ -61,3 +61,16 @@ func DecodeToolInput(raw string) (map[string]interface{}, error) {
 	}
 	return input, nil
 }
+
+// StripClaudeBillingHeader removes Claude Code billing metadata from system
+// text while preserving instructions that share the same block.
+func StripClaudeBillingHeader(text string) string {
+	lines := strings.Split(text, "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "x-anthropic-billing-header:") {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}

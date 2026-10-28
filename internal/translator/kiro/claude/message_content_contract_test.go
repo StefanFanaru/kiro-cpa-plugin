@@ -251,7 +251,7 @@ func TestBuildKiroPayloadKeepsToolInputNumbersExact(t *testing.T) {
 		t.Fatalf("tool_use input rendering changed, want %s in:\n%s", want, raw)
 	}
 }
-func TestBuildKiroPayloadDropsBillingHeaderAndSeparatesSystemBlocks(t *testing.T) {
+func TestBuildKiroPayloadDropsBillingHeaderAndKeepsSystemBlockRendering(t *testing.T) {
 	t.Parallel()
 	payload := buildTestPayload(t, `{
 		"system":[
@@ -261,7 +261,7 @@ func TestBuildKiroPayloadDropsBillingHeaderAndSeparatesSystemBlocks(t *testing.T
 		],
 		"messages":[{"role":"user","content":"hi"}]
 	}`)
-	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "You are Claude Code.\n\nMain prompt.\n\nhi" {
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "You are Claude Code.Main prompt.\n\nhi" {
 		t.Fatalf("current content = %q", got)
 	}
 }
@@ -307,7 +307,7 @@ func TestBillingHeaderDoesNotChangeKiroHistory(t *testing.T) {
 	}
 }
 
-func TestBuildKiroPayloadSeparatesTextBlocks(t *testing.T) {
+func TestBuildKiroPayloadKeepsExistingTextBlockRendering(t *testing.T) {
 	t.Parallel()
 	payload := buildTestPayload(t, `{
 		"messages":[
@@ -316,10 +316,28 @@ func TestBuildKiroPayloadSeparatesTextBlocks(t *testing.T) {
 			{"role":"user","content":"ok"}
 		]
 	}`)
-	if got := payload.ConversationState.History[0].UserInputMessage.Content; got != "first\nsecond" {
-		t.Errorf("user content = %q, want first\\nsecond", got)
+	if got := payload.ConversationState.History[0].UserInputMessage.Content; got != "firstsecond" {
+		t.Errorf("user content = %q, want firstsecond", got)
 	}
-	if got := payload.ConversationState.History[1].AssistantResponseMessage.Content; got != "alpha\nbeta" {
-		t.Errorf("assistant content = %q, want alpha\\nbeta", got)
+	if got := payload.ConversationState.History[1].AssistantResponseMessage.Content; got != "alphabeta" {
+		t.Errorf("assistant content = %q, want alphabeta", got)
+	}
+}
+
+func TestToolInputNumbersRemainExactAfterAdjacentAssistantMerge(t *testing.T) {
+	t.Parallel()
+	raw, _ := BuildKiroPayload([]byte(`{
+  "messages":[
+   {"role":"user","content":"go"},
+   {"role":"assistant","content":[{"type":"text","text":"working"}]},
+   {"role":"assistant","content":[{"type":"tool_use","id":"a","name":"T","input":{"id":12345678901234567890,"nested":[[9007199254740993],{"count":12345678901234567890}]}}]},
+   {"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"ok"}]}
+  ],
+  "tools":[{"name":"T","description":"T","input_schema":{"type":"object"}}]
+ }`), "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	for _, want := range []string{`"id":12345678901234567890`, `"nested":[[9007199254740993],{"count":12345678901234567890}]`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("lost %s after merge: %s", want, raw)
+		}
 	}
 }

@@ -311,7 +311,7 @@ func formatToolUses(toolUses []KiroToolUse) string {
 		input, _ := json.Marshal(toolUse.Input)
 		parts = append(parts, fmt.Sprintf("<tool_use id=%q name=%q>\n%s\n</tool_use>", toolUse.ToolUseID, toolUse.Name, input))
 	}
-	return strings.Join(parts, "\n\n")
+	return strings.Join(parts, "")
 }
 
 func formatToolResults(results []KiroToolResult) string {
@@ -323,7 +323,7 @@ func formatToolResults(results []KiroToolResult) string {
 		}
 		parts = append(parts, fmt.Sprintf("<tool_result id=%q status=%q>\n%s\n</tool_result>", result.ToolUseID, result.Status, strings.Join(texts, "\n")))
 	}
-	return strings.Join(parts, "\n\n")
+	return strings.Join(parts, "")
 }
 
 // attachInstructionsToFirstUserMessage preserves system instructions exactly
@@ -382,12 +382,6 @@ func normalizeOrigin(origin string) string {
 	}
 }
 
-// claudeBillingHeaderPrefix starts the system line in which Claude Code sends
-// a per-request billing fingerprint. It means nothing to Kiro and, because
-// instructions lead history[0], would change Kiro's cached prefix whenever the
-// fingerprint changes.
-const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
-
 // extractSystemPrompt extracts system prompt from Claude request
 func extractSystemPrompt(claudeBody []byte) string {
 	systemField := gjson.GetBytes(claudeBody, "system")
@@ -400,16 +394,14 @@ func extractSystemPrompt(claudeBody []byte) string {
 			} else if block.Type == gjson.String {
 				text = block.String()
 			}
-			if strings.HasPrefix(text, claudeBillingHeaderPrefix) {
-				_, text, _ = strings.Cut(text, "\n")
-			}
+			text = kirocommon.StripClaudeBillingHeader(text)
 			if text != "" {
 				parts = append(parts, text)
 			}
 		}
-		return strings.Join(parts, "\n\n")
+		return strings.Join(parts, "")
 	}
-	return systemField.String()
+	return kirocommon.StripClaudeBillingHeader(systemField.String())
 }
 
 // convertClaudeToolsToKiro converts Claude tools to Kiro format
@@ -492,7 +484,7 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 // BuildUserMessageStruct builds a user message and extracts tool results
 func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserInputMessage, []KiroToolResult) {
 	content := msg.Get("content")
-	var texts []string
+	var contentBuilder strings.Builder
 	var toolResults []KiroToolResult
 	var images []KiroImage
 
@@ -501,7 +493,7 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 			partType := part.Get("type").String()
 			switch partType {
 			case "text":
-				texts = append(texts, part.Get("text").String())
+				contentBuilder.WriteString(part.Get("text").String())
 			case "image":
 				if image, ok := kiroImageFromClaudeBlock(part); ok {
 					images = append(images, image)
@@ -553,11 +545,11 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 			}
 		}
 	} else {
-		texts = append(texts, content.String())
+		contentBuilder.WriteString(content.String())
 	}
 
 	userMsg := KiroUserInputMessage{
-		Content: joinTextBlocks(texts),
+		Content: contentBuilder.String(),
 		ModelID: modelID,
 		Origin:  origin,
 	}
@@ -567,13 +559,6 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 	}
 
 	return userMsg, toolResults
-}
-
-// joinTextBlocks joins a message's text blocks with the newline
-// kirocommon.MergeAdjacentMessages puts between merged messages, so text
-// renders the same whether it arrived as blocks or as adjacent messages.
-func joinTextBlocks(texts []string) string {
-	return strings.Join(texts, "\n")
 }
 
 // toolResultImagePlaceholder stands in for a tool result whose only content is
@@ -599,7 +584,7 @@ func kiroImageFromClaudeBlock(part gjson.Result) (KiroImage, bool) {
 // BuildAssistantMessageStruct builds an assistant message with tool uses
 func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage {
 	content := msg.Get("content")
-	var texts []string
+	var contentBuilder strings.Builder
 	var toolUses []KiroToolUse
 	var reasoningText strings.Builder
 	var reasoningSignature string
@@ -610,7 +595,7 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 			partType := part.Get("type").String()
 			switch partType {
 			case "text":
-				texts = append(texts, part.Get("text").String())
+				contentBuilder.WriteString(part.Get("text").String())
 			case "thinking":
 				reasoningText.WriteString(part.Get("thinking").String())
 				if signature := part.Get("signature").String(); signature != "" {
@@ -638,13 +623,13 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 			}
 		}
 	} else {
-		texts = append(texts, content.String())
+		contentBuilder.WriteString(content.String())
 	}
 
 	// Kiro's AssistantResponseMessage requires the content field, but the official
 	// client sends an empty string when a turn contains only tool uses. Inventing
 	// visible filler here pollutes the conversation and can be echoed by the model.
-	finalContent := joinTextBlocks(texts)
+	finalContent := contentBuilder.String()
 	var reasoningContent *KiroReasoningContent
 	if redactedContent != "" {
 		reasoningContent = &KiroReasoningContent{RedactedContent: redactedContent}

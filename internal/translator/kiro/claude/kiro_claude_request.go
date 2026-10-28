@@ -601,7 +601,7 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 	content := msg.Get("content")
 	var texts []string
 	var toolUses []KiroToolUse
-	var reasoningText string
+	var reasoningText strings.Builder
 	var reasoningSignature string
 	var redactedContent string
 
@@ -612,11 +612,8 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 			case "text":
 				texts = append(texts, part.Get("text").String())
 			case "thinking":
-				// A signature covers its own block's text only, so joined
-				// texts under one signature never verify. Kiro replays one
-				// reasoning block: the first signed one.
-				if signature := part.Get("signature").String(); signature != "" && reasoningSignature == "" {
-					reasoningText = part.Get("thinking").String()
+				reasoningText.WriteString(part.Get("thinking").String())
+				if signature := part.Get("signature").String(); signature != "" {
 					reasoningSignature = signature
 				}
 			case "redacted_thinking":
@@ -651,10 +648,10 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 	var reasoningContent *KiroReasoningContent
 	if redactedContent != "" {
 		reasoningContent = &KiroReasoningContent{RedactedContent: redactedContent}
-	} else if reasoningText != "" && reasoningSignature != "" {
+	} else if reasoningText.Len() > 0 && reasoningSignature != "" {
 		reasoningContent = &KiroReasoningContent{
 			ReasoningText: &KiroReasoningText{
-				Text:      reasoningText,
+				Text:      reasoningText.String(),
 				Signature: reasoningSignature,
 			},
 		}

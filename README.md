@@ -97,6 +97,10 @@ CPA owns credential selection, failover and the 429 backoff ladder; the plugin r
 
 For Anthropic Messages, the top-level `system` text is prepended to the first user turn. Inline `system` messages stay at their original position as user text and merge with adjacent user turns. A request ending in a nonempty inline `system` message sends that text in Kiro's current user message, merged with the preceding turn if it is also a user message. Earlier history stays unchanged.
 
+For OpenAI Chat Completions, leading `system` and `developer` messages are prepended to the first user turn. Later `system` and `developer` messages stay at their original position as user text and merge with adjacent user turns.
+
+Image content is validated in every OpenAI Chat message. An unsupported remote image URL or malformed image data URL in a later turn now returns HTTP 400. Previously, validation stopped at the first user message and the translator could silently drop a later image.
+
 Reasoning controls are advertised only when the authenticated account's Kiro model schema declares an `effort` enum. Claude models currently use `additionalModelRequestFields.output_config.effort`; GPT models use `additionalModelRequestFields.reasoning.effort`. The plugin forwards the selected level through that declared path for OpenAI Responses, Chat Completions, and Anthropic Messages.
 
 The Management API route `GET /v0/management/plugins/kiro/capabilities` (management key required) exposes only the intersection of non-secret model capability metadata discovered for the connected accounts. Local catalog synchronizers can use it instead of maintaining guessed model lists. It contains no account identifiers, profile ARNs, tokens, or quota data.

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -43,7 +44,8 @@ var (
 		sync.Mutex
 		cache       map[string]usageCacheEntry
 		lastRefresh map[string]time.Time
-	}{cache: make(map[string]usageCacheEntry), lastRefresh: make(map[string]time.Time)}
+		identities  map[string]usageIdentity
+	}{cache: make(map[string]usageCacheEntry), lastRefresh: make(map[string]time.Time), identities: make(map[string]usageIdentity)}
 	usageNow        = func() time.Time { return time.Now().UTC() }
 	usageHTTPClient = func() httpDoer {
 		return &http.Client{Timeout: usageRequestTimeout}
@@ -640,6 +642,14 @@ func collectUsageAccounts(ctx context.Context, refresh string) []usageAccountVie
 			defer group.Done()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
+			// This goroutine runs outside callHandler's recover, and a panic in
+			// a plugin goroutine ends the CPA process. Contain it to the account.
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("kiro: panic reading usage for %s: %v\n%s", credentials[index].entry.Name, recovered, debug.Stack())
+					results[index] = usagePanicView(credentials[index])
+				}
+			}()
 			force := refresh == usageRefreshAll || (refresh != "" && refresh == filepath.Base(credentials[index].entry.Name))
 			results[index] = loadUsageCredential(ctx, credentials[index], force)
 		}()
@@ -654,6 +664,17 @@ func collectUsageAccounts(ctx context.Context, refresh string) []usageAccountVie
 		return strings.ToLower(usageDisplayName(results[i])) < strings.ToLower(usageDisplayName(results[j]))
 	})
 	return results
+}
+
+// usagePanicView is the failed view of an account whose read panicked.
+func usagePanicView(credential usageCredential) usageAccountView {
+	err := errors.New("kiro: internal error reading usage")
+	account := usageAccountView{
+		Label: kiroUsageLabel(credential.token), State: "Unavailable", StateKey: usageStateUnavailable, StateClass: "error",
+		Error: publicUsageError(err), ErrorKey: publicUsageErrorKey(err),
+	}
+	decorateUsageAccount(&account, credential, nil)
+	return account
 }
 
 // usageNeedsAttention is the page's single test for a credential that is not
@@ -799,7 +820,7 @@ func loadUsageCredentialView(ctx context.Context, credential usageCredential, fo
 var errUsageTokenExpired = errors.New("kiro access token expired; waiting for CLIProxyAPI to refresh it")
 
 func fetchUsageForCredential(ctx context.Context, credential usageCredential) (usageAccountView, error) {
-	authRecord, raw, token := credential.authRecord, credential.raw, credential.token
+	token := credential.token
 	label := kiroUsageLabel(token)
 	if accessTokenExpired(token, usageNow()) {
 		return usageAccountView{Label: label}, errUsageTokenExpired
@@ -808,9 +829,10 @@ func fetchUsageForCredential(ctx context.Context, credential usageCredential) (u
 	if err != nil {
 		return usageAccountView{Label: label}, err
 	}
-	// The usage response is the only place AWS names the account, so a credential
-	// stored before this was read heals itself on the first page load.
-	if reconcileCredentialIdentity(ctx, authRecord.Name, raw, token, usage.UserInfo, usage.SubscriptionInfo.SubscriptionTitle) {
+	// Usage reads never save credential documents: CPA may still be about to
+	// publish the result of auth.refresh after the plugin releases its lock.
+	if reconcileCredentialIdentity(ctx, token, usage.UserInfo, usage.SubscriptionInfo.SubscriptionTitle) {
+		rememberUsageIdentity(credential.authRecord.Name, token)
 		label = kiroUsageLabel(token)
 	}
 	account := usageView(label, usage, usageNow())
@@ -1121,11 +1143,10 @@ func preferredUsageValue(precise, fallback *float64) float64 {
 	return 0
 }
 
-// reconcileCredentialIdentity copies AWS-reported identity into the credential
-// and persists it. It reports whether the token changed. Failures are logged and
-// ignored: the page must still render usage when the credential cannot be saved.
-func reconcileCredentialIdentity(ctx context.Context, name string, original []byte, token *kiroauth.KiroTokenData, info usageUserInfo, plan string) bool {
-	if token == nil || len(original) == 0 {
+// reconcileCredentialIdentity updates only the in-memory token used by the
+// usage view. The next auth.refresh response publishes the discovered identity.
+func reconcileCredentialIdentity(ctx context.Context, token *kiroauth.KiroTokenData, info usageUserInfo, plan string) bool {
+	if token == nil {
 		return false
 	}
 	changed := false
@@ -1142,7 +1163,7 @@ func reconcileCredentialIdentity(ctx context.Context, name string, original []by
 		changed = true
 	}
 	// The plan title is the only human-readable fact AWS reports about these
-	// accounts, so it is persisted and drives the display label.
+	// accounts, so it drives the display label and is kept for the next refresh.
 	if plan = strings.TrimSpace(plan); plan != "" && plan != strings.TrimSpace(token.SubscriptionTitle) {
 		token.SubscriptionTitle = plan
 		changed = true
@@ -1156,16 +1177,6 @@ func reconcileCredentialIdentity(ctx context.Context, name string, original []by
 		token.Email = ""
 	}
 	token.Identity = credentialIdentity(token)
-	merged, err := mergeIdentityFields(original, token)
-	if err != nil {
-		log.Printf("kiro: encode resolved credential identity failed: %v", err)
-		return true
-	}
-	request, _ := json.Marshal(pluginapi.HostAuthSaveRequest{Name: filepath.Base(name), JSON: merged})
-	var saved pluginapi.HostAuthSaveResponse
-	if err := callHostResult(pluginabi.MethodHostAuthSave, request, &saved); err != nil {
-		log.Printf("kiro: persist resolved credential identity failed: %v", err)
-	}
 	return true
 }
 
@@ -1206,31 +1217,37 @@ func discoverProfileName(ctx context.Context, token *kiroauth.KiroTokenData) str
 	return ""
 }
 
-// mergeIdentityFields writes only the identity keys back into the stored
-// document. Rewriting the whole credential here would let a page request
-// overwrite host-owned settings it never read.
-func mergeIdentityFields(original []byte, token *kiroauth.KiroTokenData) ([]byte, error) {
-	var document map[string]any
-	if err := json.Unmarshal(original, &document); err != nil {
-		return nil, fmt.Errorf("decode persisted Kiro credential: %w", err)
-	}
-	// This function only ever adds. An earlier version deleted a key whose value
-	// had become empty, which removed the email field from a Builder ID document
-	// and collapsed the panel card to a bare file name. Nothing here is allowed
-	// to remove a field the host or the user owns.
-	setIfPresent(document, "email", identityLabel(token))
-	setIfPresent(document, "awsUserId", token.AWSUserID)
-	setIfPresent(document, "identity", token.Identity)
-	setIfPresent(document, "profileName", token.ProfileName)
-	setIfPresent(document, "subscriptionTitle", token.SubscriptionTitle)
-	document["type"] = providerName
-	return json.Marshal(document)
+// usageIdentity keeps only presentation fields, never access or refresh tokens.
+type usageIdentity struct {
+	email, userID, profileName, plan string
 }
 
-func setIfPresent(document map[string]any, key, value string) {
-	if trimmed := strings.TrimSpace(value); trimmed != "" {
-		document[key] = trimmed
+func rememberUsageIdentity(name string, token *kiroauth.KiroTokenData) {
+	usageState.Lock()
+	usageState.identities[filepath.Base(name)] = usageIdentity{email: token.Email, userID: token.AWSUserID, profileName: token.ProfileName, plan: token.SubscriptionTitle}
+	usageState.Unlock()
+}
+
+func applyUsageIdentity(name string, token *kiroauth.KiroTokenData) {
+	usageState.Lock()
+	identity, ok := usageState.identities[filepath.Base(name)]
+	usageState.Unlock()
+	if !ok {
+		return
 	}
+	if looksLikeEmail(identity.email) && !looksLikeEmail(token.Email) {
+		token.Email = identity.email
+	}
+	if identity.userID != "" {
+		token.AWSUserID = identity.userID
+	}
+	if identity.profileName != "" {
+		token.ProfileName = identity.profileName
+	}
+	if identity.plan != "" {
+		token.SubscriptionTitle = identity.plan
+	}
+	token.Identity = credentialIdentity(token)
 }
 
 func kiroUsageLabel(token *kiroauth.KiroTokenData) string {

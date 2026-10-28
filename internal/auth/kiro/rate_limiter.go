@@ -39,6 +39,14 @@ type tokenState struct {
 	nextSlot          time.Time
 	unavailableUntil  time.Time
 	unavailableReason string
+	// pending holds the reservations of waiters still sleeping, in slot order.
+	pending []*reservation
+}
+
+type reservation struct {
+	slot      time.Time
+	after     time.Time
+	cancelled bool
 }
 
 // RateLimiterConfig carries the plugin settings; zero fields keep the default.
@@ -56,13 +64,23 @@ func NewRateLimiter() *RateLimiter {
 // NewRateLimiterWithConfig returns a limiter with cfg applied over the defaults.
 func NewRateLimiterWithConfig(cfg RateLimiterConfig) *RateLimiter {
 	rl := &RateLimiter{
-		states:           make(map[string]*tokenState),
-		minTokenInterval: DefaultMinTokenInterval,
-		maxTokenInterval: DefaultMaxTokenInterval,
-		jitterPercent:    DefaultJitterPercent,
-		suspendCooldown:  DefaultSuspendCooldown,
-		rng:              rand.New(rand.NewSource(time.Now().UnixNano())),
+		states:        make(map[string]*tokenState),
+		jitterPercent: DefaultJitterPercent,
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
+	rl.Configure(cfg)
+	return rl
+}
+
+// Configure applies cfg over the defaults in place. Per-credential pacing and
+// out-of-rotation state survive, so a host reconfigure neither lets a burst
+// through nor puts a parked credential back into rotation.
+func (rl *RateLimiter) Configure(cfg RateLimiterConfig) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.minTokenInterval = DefaultMinTokenInterval
+	rl.maxTokenInterval = DefaultMaxTokenInterval
+	rl.suspendCooldown = DefaultSuspendCooldown
 	if cfg.MinTokenInterval > 0 {
 		rl.minTokenInterval = cfg.MinTokenInterval
 	}
@@ -72,7 +90,6 @@ func NewRateLimiterWithConfig(cfg RateLimiterConfig) *RateLimiter {
 	if cfg.SuspendCooldown > 0 {
 		rl.suspendCooldown = cfg.SuspendCooldown
 	}
-	return rl
 }
 
 func (rl *RateLimiter) state(tokenKey string) *tokenState {
@@ -96,7 +113,9 @@ func (rl *RateLimiter) calculateInterval() time.Duration {
 
 // WaitForToken blocks until the credential's next request slot or until ctx
 // ends. The slot is reserved before sleeping, so concurrent callers on one
-// credential queue behind each other instead of waking together.
+// credential queue behind each other instead of waking together. A waiter
+// whose ctx ends gives its slot back once no live waiter is queued behind it,
+// so abandoned requests do not push the credential's next slot into the future.
 func (rl *RateLimiter) WaitForToken(ctx context.Context, tokenKey string) error {
 	rl.mu.Lock()
 	state := rl.state(tokenKey)
@@ -105,19 +124,52 @@ func (rl *RateLimiter) WaitForToken(ctx context.Context, tokenKey string) error 
 		slot = now
 	}
 	state.nextSlot = slot.Add(rl.calculateInterval())
-	rl.mu.Unlock()
-
 	wait := time.Until(slot)
 	if wait <= 0 {
+		rl.mu.Unlock()
 		return ctx.Err()
 	}
+	reserved := &reservation{slot: slot, after: state.nextSlot}
+	state.pending = append(state.pending, reserved)
+	rl.mu.Unlock()
+
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		rl.finish(state, reserved, false)
 		return nil
 	case <-ctx.Done():
+		rl.finish(state, reserved, true)
 		return ctx.Err()
+	}
+}
+
+// finish drops a waiter's reservation. A served one also drops every
+// reservation ahead of it, whose slots can no longer be given back. A
+// cancelled one is only marked; the trailing run of cancelled reservations is
+// then rolled back, which keeps every live waiter's slot and the gap after the
+// last of them.
+func (rl *RateLimiter) finish(state *tokenState, reserved *reservation, cancelled bool) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if cancelled {
+		reserved.cancelled = true
+	} else {
+		for i, pending := range state.pending {
+			if pending == reserved {
+				state.pending = state.pending[i+1:]
+				break
+			}
+		}
+	}
+	for n := len(state.pending); n > 0 && state.pending[n-1].cancelled; n-- {
+		// A later immediate grant can advance nextSlot without a reservation.
+		// Only undo the update made by this reservation.
+		if state.nextSlot.Equal(state.pending[n-1].after) {
+			state.nextSlot = state.pending[n-1].slot
+		}
+		state.pending = state.pending[:n-1]
 	}
 }
 
@@ -132,7 +184,10 @@ func (rl *RateLimiter) MarkUnavailable(tokenKey, reason string, window time.Dura
 
 // MarkSuspended applies the configured suspension cooldown to the credential.
 func (rl *RateLimiter) MarkSuspended(tokenKey string) {
-	rl.MarkUnavailable(tokenKey, ReasonSuspended, rl.suspendCooldown)
+	rl.mu.Lock()
+	cooldown := rl.suspendCooldown
+	rl.mu.Unlock()
+	rl.MarkUnavailable(tokenKey, ReasonSuspended, cooldown)
 }
 
 // TokenUnavailable reports why a credential is out of rotation and for how

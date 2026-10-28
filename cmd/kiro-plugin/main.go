@@ -1206,6 +1206,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	applyUsageIdentity(resolveAuthFileName(req.Attributes, req.AuthID), refreshed)
 	relistModels(req.AuthID, refreshed)
 	clearUsageCache()
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authDataForHostUpdate(refreshed, req.Attributes, req.AuthID), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})

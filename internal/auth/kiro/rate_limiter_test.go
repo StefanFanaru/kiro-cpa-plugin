@@ -204,3 +204,19 @@ func TestConfigDefaultsFillUnsetFields(t *testing.T) {
 		t.Fatalf("defaults not applied: %+v", limiter)
 	}
 }
+
+func TestExpiredWaiterCancellationKeepsLaterImmediateGrantGap(t *testing.T) {
+	limiter := newTestLimiter(time.Second, time.Second, time.Hour)
+	past := time.Now().Add(-2 * time.Second)
+	reserved := &reservation{slot: past, after: past.Add(time.Second)}
+	state := &tokenState{nextSlot: past.Add(time.Second), pending: []*reservation{reserved}}
+	limiter.states["cred"] = state
+	if err := limiter.WaitForToken(context.Background(), "cred"); err != nil {
+		t.Fatal(err)
+	}
+	grantedNext := state.nextSlot
+	limiter.finish(state, reserved, true)
+	if !state.nextSlot.Equal(grantedNext) {
+		t.Fatalf("cancellation erased the immediate grant's gap: next slot %v, want %v", state.nextSlot, grantedNext)
+	}
+}

@@ -508,6 +508,7 @@ func resetUsageState() {
 	usageState.Lock()
 	usageState.cache = make(map[string]usageCacheEntry)
 	usageState.lastRefresh = make(map[string]time.Time)
+	usageState.identities = make(map[string]usageIdentity)
 	usageState.Unlock()
 }
 
@@ -1018,61 +1019,28 @@ func TestUsageResponseCarriesUserInfo(t *testing.T) {
 	}
 }
 
-// The identity discovered from the usage response must be persisted, and only
-// the identity keys may be written: host-owned settings are not ours to rewrite.
-func TestReconcileCredentialIdentityPersistsOnlyIdentityFields(t *testing.T) {
-	original := []byte(`{"type":"kiro","authMethod":"idc","email":"kiro-idc-03c0c60ca707","priority":6,"disable_cooling":true,"accessToken":"secret-token"}`)
-	var saved []byte
+// A usage view adopts identity in memory without calling the host to write it.
+func TestReconcileCredentialIdentityDoesNotWriteCredentials(t *testing.T) {
 	previous := usageHostCall
 	usageHostCall = func(method string, request []byte) ([]byte, error) {
-		if method == pluginabi.MethodHostAuthSave {
-			var save pluginapi.HostAuthSaveRequest
-			if err := json.Unmarshal(request, &save); err != nil {
-				return nil, err
-			}
-			saved = save.JSON
-			return okEnvelope(pluginapi.HostAuthSaveResponse{})
-		}
-		return errorEnvelope("unexpected", method), nil
+		t.Fatalf("unexpected host call %s", method)
+		return nil, nil
 	}
 	defer func() { usageHostCall = previous }()
-
-	token := &kiroauth.KiroTokenData{AuthMethod: "idc", Email: "kiro-idc-03c0c60ca707", AccessToken: "secret-token"}
-	changed := reconcileCredentialIdentity(context.Background(), "kiro-idc.json", original, token, usageUserInfo{UserID: "d-90667c527c.9f3a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8"}, "KIRO POWER")
-	if !changed {
-		t.Fatal("discovered identity was ignored")
+	token := &kiroauth.KiroTokenData{AuthMethod: "idc", Email: "kiro-idc-old", AccessToken: "old-access", RefreshToken: "old-refresh"}
+	if !reconcileCredentialIdentity(context.Background(), token, usageUserInfo{UserID: "d-1.user"}, "KIRO POWER") {
+		t.Fatal("discovered identity ignored")
 	}
-	if token.AWSUserID != "d-90667c527c.9f3a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8" {
-		t.Fatalf("token user id: %q", token.AWSUserID)
+	if token.Email != "" || token.AWSUserID != "d-1.user" || token.SubscriptionTitle != "KIRO POWER" {
+		t.Fatalf("identity not adopted: %+v", token)
 	}
-	if token.Email != "" {
-		t.Fatalf("synthetic email survived: %q", token.Email)
-	}
-	var document map[string]any
-	if err := json.Unmarshal(saved, &document); err != nil {
-		t.Fatalf("decode saved credential: %v", err)
-	}
-	// The email key is rewritten to the readable label, never deleted: deleting it
-	// is what collapsed the panel card to a bare file name.
-	if document["email"] != "Kiro Power · IdC · 9f3a1b2c" {
-		t.Fatalf("account label not persisted into email: %s", saved)
-	}
-	if document["subscriptionTitle"] != "KIRO POWER" {
-		t.Fatalf("plan not persisted: %s", saved)
-	}
-	if document["awsUserId"] != "d-90667c527c.9f3a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8" {
-		t.Fatalf("awsUserId not persisted: %s", saved)
-	}
-	if document["priority"] != float64(6) || document["disable_cooling"] != true {
-		t.Fatalf("host-owned settings were lost: %s", saved)
-	}
-	if document["accessToken"] != "secret-token" {
-		t.Fatalf("credential secret was dropped: %s", saved)
+	if token.AccessToken != "old-access" || token.RefreshToken != "old-refresh" {
+		t.Fatal("identity changed tokens")
 	}
 }
 
 // A usage read that waited on the credential lock behind auth.refresh must not
-// save the document it read before waiting: that would put the old tokens back.
+// write credentials while CPA has not yet saved its refresh result.
 func TestUsageReconcileDoesNotRevertConcurrentRefresh(t *testing.T) {
 	originalHostCall, originalHTTPClient, originalNow, originalLister := usageHostCall, usageHTTPClient, usageNow, usageProfileLister
 	t.Cleanup(func() {
@@ -1084,6 +1052,7 @@ func TestUsageReconcileDoesNotRevertConcurrentRefresh(t *testing.T) {
 	usageNow = func() time.Time { return now }
 	usageProfileLister = func(context.Context, *http.Client, string, string) ([]availableProfile, error) { return nil, nil }
 	var mu sync.Mutex
+	writes := 0
 	store := map[string]any{
 		"type": "kiro", "authMethod": "builder-id", "region": "us-east-1", "clientIdHash": "lock-a2",
 		"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": now.Add(time.Hour).Format(time.RFC3339),
@@ -1103,6 +1072,7 @@ func TestUsageReconcileDoesNotRevertConcurrentRefresh(t *testing.T) {
 			}
 			return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "one", Name: "one.json", JSON: raw})
 		case pluginabi.MethodHostAuthSave:
+			writes++
 			var save pluginapi.HostAuthSaveRequest
 			_ = json.Unmarshal(request, &save)
 			store = map[string]any{}
@@ -1122,19 +1092,16 @@ func TestUsageReconcileDoesNotRevertConcurrentRefresh(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); collectUsageAccounts(context.Background(), "") }()
 	<-read
-	time.Sleep(50 * time.Millisecond)
-	mu.Lock()
-	store["accessToken"], store["refreshToken"] = "new-access", "new-refresh"
-	mu.Unlock()
-	lock.Unlock()
+	lock.Unlock() // CPA has the refreshed token but has not published it yet.
 	<-done
 	mu.Lock()
 	defer mu.Unlock()
-	if store["refreshToken"] != "new-refresh" || store["accessToken"] != "new-access" {
-		t.Fatalf("usage reconcile reverted the refreshed token: accessToken=%v refreshToken=%v", store["accessToken"], store["refreshToken"])
+	if writes != 0 {
+		t.Fatalf("usage wrote the old credential %d times before CPA saved its refresh", writes)
 	}
-	if store["awsUserId"] != "d-1.user" {
-		t.Fatalf("identity was not persisted: %v", store)
+	store["accessToken"], store["refreshToken"] = "new-access", "new-refresh"
+	if _, exists := store["awsUserId"]; exists {
+		t.Fatalf("usage unexpectedly changed the stored identity: %v", store)
 	}
 }
 
@@ -1150,13 +1117,13 @@ func TestReconcileCredentialIdentityAdoptsRealEmailAndSkipsNoOpSaves(t *testing.
 	defer func() { usageHostCall = previous }()
 
 	token := &kiroauth.KiroTokenData{AuthMethod: "builder-id", AWSUserID: "d-1.2222"}
-	if reconcileCredentialIdentity(context.Background(), "kiro.json", []byte(`{"type":"kiro"}`), token, usageUserInfo{UserID: "d-1.2222"}, "") {
+	if reconcileCredentialIdentity(context.Background(), token, usageUserInfo{UserID: "d-1.2222"}, "") {
 		t.Fatal("an unchanged identity triggered a save")
 	}
 	if calls != 0 {
 		t.Fatalf("host was called %d times for an unchanged identity", calls)
 	}
-	if !reconcileCredentialIdentity(context.Background(), "kiro.json", []byte(`{"type":"kiro"}`), token, usageUserInfo{Email: "person@example.com", UserID: "d-1.2222"}, "") {
+	if !reconcileCredentialIdentity(context.Background(), token, usageUserInfo{Email: "person@example.com", UserID: "d-1.2222"}, "") {
 		t.Fatal("a newly reported address was ignored")
 	}
 	if token.Email != "person@example.com" {
@@ -1458,84 +1425,55 @@ func TestAccountColumnCarriesTheReadableLabelNotTheMachineIdentity(t *testing.T)
 	}
 }
 
-// Deleting a key from the credential document is what emptied the panel card.
-// This function may only add.
-func TestIdentityMergeNeverRemovesAField(t *testing.T) {
-	// identity and profileName exist in the document but are empty on the token,
-	// which is exactly the shape that used to get the key deleted.
-	original := []byte(`{"type":"kiro","authMethod":"builder-id","email":"stale-value","identity":"kiro-old","profileName":"KiroProfile-us-east-1","priority":6,"disable_cooling":true,"note":"tai khoan chinh","accessToken":"secret"}`)
-	token := &kiroauth.KiroTokenData{AuthMethod: "builder-id", AWSUserID: "d-1.11112222-3333", SubscriptionTitle: "KIRO FREE"}
-	merged, err := mergeIdentityFields(original, token)
-	if err != nil {
-		t.Fatalf("merge: %v", err)
-	}
-	var before, after map[string]any
-	if err := json.Unmarshal(original, &before); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(merged, &after); err != nil {
-		t.Fatal(err)
-	}
-	for key := range before {
-		if _, present := after[key]; !present {
-			t.Fatalf("field %q was removed from the credential: %s", key, merged)
-		}
-	}
-	if after["note"] != "tai khoan chinh" || after["priority"] != float64(6) || after["disable_cooling"] != true {
-		t.Fatalf("host-owned settings changed: %s", merged)
-	}
-	if after["email"] != "Kiro Free · Builder ID · 11112222" {
-		t.Fatalf("stale account value was not replaced by the label: %s", merged)
-	}
-	if after["subscriptionTitle"] != "KIRO FREE" {
-		t.Fatalf("plan not persisted: %s", merged)
-	}
-}
-
-// The plan is the only readable fact AWS gives, so a usage fetch has to keep it.
-func TestUsageFetchPersistsThePlanForTheLabel(t *testing.T) {
-	var saved []byte
-	previous := usageHostCall
+func TestRefreshPublishesUsageIdentityWithoutReplacingTokens(t *testing.T) {
+	originalRefresh, originalHTTP, originalHost := authRefreshCredential, usageHTTPClient, usageHostCall
+	t.Cleanup(func() {
+		authRefreshCredential, usageHTTPClient, usageHostCall = originalRefresh, originalHTTP, originalHost
+		resetUsageState()
+	})
+	resetUsageState()
 	usageHostCall = func(method string, request []byte) ([]byte, error) {
-		if method == pluginabi.MethodHostAuthSave {
-			var save pluginapi.HostAuthSaveRequest
-			if err := json.Unmarshal(request, &save); err != nil {
-				return nil, err
-			}
-			saved = save.JSON
-			return okEnvelope(pluginapi.HostAuthSaveResponse{})
-		}
-		return errorEnvelope("unexpected", method), nil
+		t.Fatalf("usage called the host: %s", method)
+		return nil, nil
 	}
-	defer func() { usageHostCall = previous }()
-
-	token := &kiroauth.KiroTokenData{AuthMethod: "builder-id", AWSUserID: "d-1234567890.abcd1234-9999"}
-	if !reconcileCredentialIdentity(context.Background(), "kiro.json", []byte(`{"type":"kiro","authMethod":"builder-id"}`), token, usageUserInfo{}, "KIRO FREE") {
-		t.Fatal("the reported plan was ignored")
+	usageHTTPClient = func() httpDoer {
+		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
+			return catalogResponse(http.StatusOK, `{"userInfo":{"userId":"d-1.abcdef12"},"subscriptionInfo":{"subscriptionTitle":"KIRO FREE"},"usageBreakdownList":[]}`), nil
+		})
 	}
-	if token.SubscriptionTitle != "KIRO FREE" {
-		t.Fatalf("plan not adopted: %q", token.SubscriptionTitle)
+	token := &kiroauth.KiroTokenData{AuthMethod: "builder-id", ClientIDHash: "identity-refresh", AccessToken: "old-access", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}
+	if _, err := fetchUsageForCredential(context.Background(), usageCredential{authRecord: pluginapi.HostAuthGetResponse{Name: "existing.json"}, token: token}); err != nil {
+		t.Fatal(err)
 	}
-	if got := identityLabel(token); got != "Kiro Free · Builder ID · abcd1234" {
-		t.Fatalf("label after adoption: %q", got)
+	authRefreshCredential = func(context.Context, *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+		return &kiroauth.KiroTokenData{AuthMethod: "builder-id", ClientIDHash: "identity-refresh", AccessToken: "new-access", RefreshToken: "new-refresh", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}, nil
 	}
-	var document map[string]any
-	if err := json.Unmarshal(saved, &document); err != nil {
-		t.Fatalf("decode saved credential: %v", err)
-	}
-	if document["subscriptionTitle"] != "KIRO FREE" {
-		t.Fatalf("plan was not persisted: %s", saved)
-	}
-	// A persisted plan is useless if it cannot be read back on the next start.
-	reloaded, err := decodeKiroCredential(saved)
+	stubCatalog(t, func(*http.Request) (*http.Response, error) {
+		return catalogResponse(http.StatusOK, builderIDCatalog), nil
+	})
+	request, _ := json.Marshal(pluginapi.AuthRefreshRequest{AuthID: "existing.json", StorageJSON: json.RawMessage(`{"authMethod":"builder-id","clientIdHash":"identity-refresh","accessToken":"old-access","refreshToken":"old-refresh"}`)})
+	raw, err := handleRefreshAuth(request)
 	if err != nil {
-		t.Fatalf("reload saved credential: %v", err)
+		t.Fatal(err)
 	}
-	if reloaded.SubscriptionTitle != "KIRO FREE" {
-		t.Fatalf("plan did not survive a document round trip: %q", reloaded.SubscriptionTitle)
+	var envelope struct {
+		Result pluginapi.AuthRefreshResponse `json:"result"`
 	}
-	if got := identityLabel(reloaded); got != "Kiro Free · Builder ID · abcd1234" {
-		t.Fatalf("label after reload: %q", got)
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := decodeKiroCredential(envelope.Result.Auth.StorageJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.AccessToken != "new-access" || refreshed.RefreshToken != "new-refresh" {
+		t.Fatal("identity cache replaced refreshed tokens")
+	}
+	if refreshed.AWSUserID != "d-1.abcdef12" || refreshed.SubscriptionTitle != "KIRO FREE" {
+		t.Fatalf("refresh omitted discovered identity: %+v", refreshed)
+	}
+	if envelope.Result.Auth.FileName != "existing.json" {
+		t.Fatal("refresh renamed credential")
 	}
 }
 

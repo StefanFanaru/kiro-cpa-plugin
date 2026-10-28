@@ -45,6 +45,7 @@ type tokenState struct {
 
 type reservation struct {
 	slot      time.Time
+	after     time.Time
 	cancelled bool
 }
 
@@ -128,7 +129,7 @@ func (rl *RateLimiter) WaitForToken(ctx context.Context, tokenKey string) error 
 		rl.mu.Unlock()
 		return ctx.Err()
 	}
-	reserved := &reservation{slot: slot}
+	reserved := &reservation{slot: slot, after: state.nextSlot}
 	state.pending = append(state.pending, reserved)
 	rl.mu.Unlock()
 
@@ -163,7 +164,11 @@ func (rl *RateLimiter) finish(state *tokenState, reserved *reservation, cancelle
 		}
 	}
 	for n := len(state.pending); n > 0 && state.pending[n-1].cancelled; n-- {
-		state.nextSlot = state.pending[n-1].slot
+		// A later immediate grant can advance nextSlot without a reservation.
+		// Only undo the update made by this reservation.
+		if state.nextSlot.Equal(state.pending[n-1].after) {
+			state.nextSlot = state.pending[n-1].slot
+		}
 		state.pending = state.pending[:n-1]
 	}
 }

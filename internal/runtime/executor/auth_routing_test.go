@@ -433,54 +433,6 @@ func TestRetryExhaustionReturnsTheLastUpstreamStatus(t *testing.T) {
 	}
 }
 
-// A 5xx with Retry-After is Kiro naming when the credential may come back.
-// Retrying it locally on the same credential spent the window on requests Kiro
-// had already refused and then dropped the Retry-After; it goes straight back to
-// CPA with the window, like a 429.
-func TestServerErrorWithRetryAfterIsForwardedWithoutLocalRetry(t *testing.T) {
-	originalDelay := calculateRetryDelay
-	delays := 0
-	calculateRetryDelay = func(int) time.Duration { delays++; return time.Millisecond }
-	t.Cleanup(func() { calculateRetryDelay = originalDelay })
-
-	for _, test := range []struct {
-		name    string
-		execute func(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) error
-	}{
-		{name: "non-stream", execute: func(ctx context.Context, auth *cliproxyauth.Auth, request cliproxyexecutor.Request, options cliproxyexecutor.Options) error {
-			_, err := NewKiroExecutor(nil).Execute(ctx, auth, request, options)
-			return err
-		}},
-		{name: "stream", execute: func(ctx context.Context, auth *cliproxyauth.Auth, request cliproxyexecutor.Request, options cliproxyexecutor.Options) error {
-			_, err := NewKiroExecutor(nil).ExecuteStream(ctx, auth, request, options)
-			return err
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			delays = 0
-			requests := 0
-			stubUpstream(t, func(*http.Request) (*http.Response, error) {
-				requests++
-				return upstreamStatus(http.StatusServiceUnavailable, http.Header{"Retry-After": []string{"120"}}, "{\"message\":\"busy\"}"), nil
-			})
-			request, options := executorTestRequest()
-
-			err := test.execute(t.Context(), builderIDAuth("retry-after-5xx-"+test.name), request, options)
-			var retryAfter *time.Duration
-			if carrier, ok := err.(interface{ RetryAfter() *time.Duration }); ok {
-				retryAfter = carrier.RetryAfter()
-			}
-			status, ok := err.(interface{ StatusCode() int })
-			if !ok || status.StatusCode() != http.StatusServiceUnavailable || retryAfter == nil || *retryAfter != 2*time.Minute {
-				t.Fatalf("5xx with Retry-After = %T %v (retry-after %v), want 503 with 2m", err, err, retryAfter)
-			}
-			if requests != 1 || delays != 0 {
-				t.Fatalf("plugin made %d upstream requests and %d local backoffs, want 1 and 0", requests, delays)
-			}
-		})
-	}
-}
-
 // With a proxy configured, the cache must share the transport and nothing
 // else: a stream client requested after a 120s non-stream client carries no
 // timeout, and both reuse the same connection pool.

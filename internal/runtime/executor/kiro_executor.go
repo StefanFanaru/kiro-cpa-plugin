@@ -877,11 +877,6 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-			// A Retry-After names when the credential may come back: CPA owns
-			// that wait and the failover, as for 429.
-			if retryAfter := retryAfterHeader(httpResp.Header); retryAfter != nil {
-				return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: retryAfter}
-			}
 			if attempt < maxRetries {
 				delay := calculateRetryDelay(attempt)
 				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("HTTP %d", httpResp.StatusCode), delay, endpoint.Name)
@@ -1135,11 +1130,6 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-			// A Retry-After names when the credential may come back: CPA owns
-			// that wait and the failover, as for 429.
-			if retryAfter := retryAfterHeader(httpResp.Header); retryAfter != nil {
-				return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: retryAfter}
-			}
 			if attempt < maxRetries {
 				delay := calculateRetryDelay(attempt)
 				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("stream HTTP %d", httpResp.StatusCode), delay, endpoint.Name)

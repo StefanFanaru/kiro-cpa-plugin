@@ -1338,6 +1338,10 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 			break
 		}
 
+		if err := eventStreamException(msg); err != nil {
+			return "", nil, nil, usageInfo, 0, stopReason, err
+		}
+
 		eventType := msg.EventType
 		payload := msg.Payload
 		if len(payload) == 0 {
@@ -1795,15 +1799,13 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 	var reasoning *kiroclaude.KiroReasoningContent
 	if redactedReasoning != "" {
 		reasoning = &kiroclaude.KiroReasoningContent{RedactedContent: redactedReasoning}
-	} else if reasoningText.Len() > 0 && reasoningSignature != "" {
+	} else if reasoningText.Len() > 0 {
 		reasoning = &kiroclaude.KiroReasoningContent{
 			ReasoningText: &kiroclaude.KiroReasoningText{
 				Text:      reasoningText.String(),
 				Signature: reasoningSignature,
 			},
 		}
-	} else if reasoningText.Len() > 0 {
-		log.Warn("kiro: dropping unsigned reasoning from buffered response")
 	}
 
 	return cleanedContent, reasoning, toolUses, usageInfo, upstreamContextPercentage, stopReason, nil
@@ -2002,6 +2004,37 @@ func (e *KiroExecutor) eventStreamStringHeaders(headers []byte) map[string]strin
 	return values
 }
 
+// eventStreamException returns the error an AWS exception or error frame
+// carries, or nil for an event frame. Such a frame has no :event-type and may
+// have no payload, so it must be classified before either is looked at.
+func eventStreamException(msg *eventStreamMessage) error {
+	messageType := msg.Headers[":message-type"]
+	if messageType != "exception" && messageType != "error" {
+		return nil
+	}
+	errType := msg.Headers[":exception-type"]
+	if errType == "" {
+		errType = msg.Headers[":error-code"]
+	}
+	if errType == "" {
+		errType = messageType
+	}
+	errMsg := msg.Headers[":error-message"]
+	if errMsg == "" {
+		var body struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(msg.Payload, &body) == nil {
+			errMsg = body.Message
+		}
+	}
+	if errMsg == "" {
+		errMsg = errType
+	}
+	log.Errorf("kiro: received %s frame in event stream: type=%s, message=%s", messageType, errType, errMsg)
+	return streamStatusError(errType, errMsg)
+}
+
 // streamToChannel converts AWS Event Stream to channel-based streaming.
 // Supports tool calling - emits tool_use content blocks when tools are used.
 // Buffers official toolUseEvent input fragments without repairing malformed JSON.
@@ -2037,10 +2070,10 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 
 	isThinkingBlockOpen := false // Track if thinking content block SSE event is open
 	thinkingBlockIndex := -1     // Index of the thinking content block
-	var pendingReasoning strings.Builder
 
 	contentBlockIndex := -1
 	messageStartSent := false
+	var messageStart []byte
 	isTextBlockOpen := false
 	var trace streamFrameTrace
 
@@ -2051,12 +2084,18 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 	// A frame with no payload and one whose payload is not JSON are both skipped
 	// before reaching the switch, so a stream made only of those used to close
 	// without ever opening.
+	// It is sent with the first output, not with the first event: CPA fails
+	// over to another credential only while no payload has reached the
+	// client, so an upstream error on the first frame must be the first chunk.
+	// The event is still built at the first event, with the usage known then.
 	emitMessageStart := func() {
 		if messageStartSent {
 			return
 		}
-		msgStart := kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
-		sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, msgStart, &translatorParam)
+		if messageStart == nil {
+			messageStart = kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
+		}
+		sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, messageStart, &translatorParam)
 		for _, chunk := range sseData {
 			if len(chunk) > 0 {
 				out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
@@ -2094,6 +2133,13 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			break
 		}
 		trace.record(msg)
+		if err := eventStreamException(msg); err != nil {
+			if contentBlockIndex < 0 {
+				log.Warnf("kiro: stream ended without a content block (credential=%s model=%s): %s", streamTraceLabel(ctx), model, &trace)
+			}
+			out <- cliproxyexecutor.StreamChunk{Err: err}
+			return false
+		}
 
 		eventType := msg.EventType
 		payload := msg.Payload
@@ -2146,7 +2192,9 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			log.Debugf("kiro: streamToChannel found stopReason (top-level): %s", upstreamStopReason)
 		}
 
-		emitMessageStart()
+		if messageStart == nil {
+			messageStart = kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
+		}
 
 		switch eventType {
 		case "followupPromptEvent":
@@ -2293,9 +2341,16 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 				}
 			}
 
+			// Text inside an open tool_use block would corrupt the block indexes.
+			if currentToolUse != nil && (contentDelta != "" || len(toolUses) > 0) {
+				out <- cliproxyexecutor.StreamChunk{Err: streamProtocolError(fmt.Sprintf("text arrived during tool call %q", aliases.original(currentToolUse.Name)))}
+				return false
+			}
+
 			// Assistant response events are text. Reasoning is emitted only from the
 			// dedicated reasoningContentEvent below; textual tags are never reinterpreted.
 			if contentDelta != "" || len(toolUses) > 0 {
+				emitMessageStart()
 				if isThinkingBlockOpen {
 					blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
 					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
@@ -2305,10 +2360,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 						}
 					}
 					isThinkingBlockOpen = false
-				} else if pendingReasoning.Len() > 0 {
-					log.Warn("kiro: dropping unsigned reasoning before assistant response")
 				}
-				pendingReasoning.Reset()
 			}
 			if contentDelta != "" {
 				outputForUsage.WriteString(contentDelta)
@@ -2338,7 +2390,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 
 				duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
 				if err != nil {
-					out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", err.Error())}
+					out <- cliproxyexecutor.StreamChunk{Err: streamProtocolError(err.Error())}
 					return false
 				}
 				if duplicate {
@@ -2402,9 +2454,11 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			}
 
 		case "reasoningContentEvent":
-			// Kiro fragments reasoning text and sends its signature in a later event.
-			// Buffer text until that signature arrives so internal reasoning cannot be
-			// mistaken for visible assistant output.
+			// Kiro fragments reasoning text and signs it in a later event, after the
+			// last fragment. Fragments go out as they arrive, in a thinking block so
+			// they are never mistaken for visible text: buffering them until the
+			// signature left the client with no progress for the whole reasoning
+			// phase, and Claude Code abandons a stream that is silent for five minutes.
 			var thinkingText string
 			var signature string
 			var redactedContent string
@@ -2432,18 +2486,48 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 				}
 			}
 
-			if thinkingText != "" {
-				outputForUsage.WriteString(thinkingText)
-				if isThinkingBlockOpen {
-					thinkingEvent := kiroclaude.BuildClaudeThinkingDeltaEvent(thinkingText, thinkingBlockIndex)
-					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, thinkingEvent, &translatorParam)
+			if currentToolUse != nil && (thinkingText != "" || signature != "" || redactedContent != "") {
+				out <- cliproxyexecutor.StreamChunk{Err: streamProtocolError(fmt.Sprintf("reasoning arrived during tool call %q", aliases.original(currentToolUse.Name)))}
+				return false
+			}
+			// An empty delta writes nothing, so it must not start the message: an
+			// error after it would no longer be the first chunk.
+			if thinkingText != "" || signature != "" || redactedContent != "" {
+				emitMessageStart()
+			}
+
+			if thinkingText != "" || (signature != "" && redactedContent == "") {
+				if isTextBlockOpen && contentBlockIndex >= 0 {
+					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
+					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 					for _, chunk := range sseData {
 						if len(chunk) > 0 {
 							out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
 						}
 					}
-				} else {
-					pendingReasoning.WriteString(thinkingText)
+					isTextBlockOpen = false
+				}
+				if !isThinkingBlockOpen {
+					contentBlockIndex++
+					thinkingBlockIndex = contentBlockIndex
+					isThinkingBlockOpen = true
+					blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(thinkingBlockIndex, "thinking", "", "")
+					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
+					for _, chunk := range sseData {
+						if len(chunk) > 0 {
+							out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
+						}
+					}
+				}
+			}
+			if thinkingText != "" {
+				outputForUsage.WriteString(thinkingText)
+				thinkingEvent := kiroclaude.BuildClaudeThinkingDeltaEvent(thinkingText, thinkingBlockIndex)
+				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, thinkingEvent, &translatorParam)
+				for _, chunk := range sseData {
+					if len(chunk) > 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
+					}
 				}
 			}
 
@@ -2468,7 +2552,6 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 					}
 					isThinkingBlockOpen = false
 				}
-				pendingReasoning.Reset()
 				contentBlockIndex++
 				blockStart := kiroclaude.BuildClaudeRedactedThinkingBlockStartEvent(contentBlockIndex, redactedContent)
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
@@ -2485,38 +2568,6 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 					}
 				}
 			} else if signature != "" {
-				if isTextBlockOpen && contentBlockIndex >= 0 {
-					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
-					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
-					for _, chunk := range sseData {
-						if len(chunk) > 0 {
-							out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
-						}
-					}
-					isTextBlockOpen = false
-				}
-				if !isThinkingBlockOpen {
-					contentBlockIndex++
-					thinkingBlockIndex = contentBlockIndex
-					isThinkingBlockOpen = true
-					blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(thinkingBlockIndex, "thinking", "", "")
-					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
-					for _, chunk := range sseData {
-						if len(chunk) > 0 {
-							out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
-						}
-					}
-				}
-				if pendingReasoning.Len() > 0 {
-					thinkingEvent := kiroclaude.BuildClaudeThinkingDeltaEvent(pendingReasoning.String(), thinkingBlockIndex)
-					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, thinkingEvent, &translatorParam)
-					for _, chunk := range sseData {
-						if len(chunk) > 0 {
-							out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
-						}
-					}
-					pendingReasoning.Reset()
-				}
 				signatureEvent := kiroclaude.BuildClaudeSignatureDeltaEvent(signature, thinkingBlockIndex)
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, signatureEvent, &translatorParam)
 				for _, chunk := range sseData {
@@ -2527,7 +2578,16 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			}
 
 		case "toolUseEvent":
-			// Handle dedicated tool use events with input buffering
+			step, newState, toolErr := kiroclaude.StreamToolUseEvent(event, currentToolUse, processedIDs)
+			if toolErr != nil {
+				out <- cliproxyexecutor.StreamChunk{Err: streamProtocolError(toolErr.Error())}
+				return false
+			}
+			currentToolUse = newState
+			if !step.Started && step.Fragment == "" && step.Completed == nil {
+				continue
+			}
+			emitMessageStart()
 			if isThinkingBlockOpen {
 				blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
@@ -2537,23 +2597,14 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 					}
 				}
 				isThinkingBlockOpen = false
-			} else if pendingReasoning.Len() > 0 {
-				log.Warn("kiro: dropping unsigned reasoning before tool use")
 			}
-			pendingReasoning.Reset()
 
-			completedToolUses, newState, toolErr := kiroclaude.ProcessToolUseEvent(event, currentToolUse, processedIDs)
-			if toolErr != nil {
-				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", toolErr.Error())}
-				return false
-			}
-			currentToolUse = newState
-
-			// Emit completed tool uses
-			for _, tu := range completedToolUses {
-				hasToolUses = true
+			// Input fragments are forwarded as they arrive: a large tool input
+			// otherwise leaves the client without an event until it is complete.
+			if step.Started {
 				outputForUsage.WriteString("\n")
-				outputForUsage.WriteString(tu.Name)
+				outputForUsage.WriteString(step.Name)
+				outputForUsage.WriteString("\n")
 
 				// Close text block if open
 				if isTextBlockOpen && contentBlockIndex >= 0 {
@@ -2569,33 +2620,30 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 
 				contentBlockIndex++
 
-				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", tu.ToolUseID, aliases.original(tu.Name))
+				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", step.ToolUseID, aliases.original(step.Name))
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 				for _, chunk := range sseData {
 					if len(chunk) > 0 {
 						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
 					}
 				}
+			}
 
-				if tu.Input != nil {
-					inputJSON, err := json.Marshal(tu.Input)
-					if err != nil {
-						log.Debugf("kiro: failed to marshal tool input in toolUseEvent: %v", err)
-					} else {
-						outputForUsage.WriteString("\n")
-						outputForUsage.Write(inputJSON)
-						inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputJSON), contentBlockIndex)
-						sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
-						for _, chunk := range sseData {
-							if len(chunk) > 0 {
-								out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
-							}
-						}
+			if step.Fragment != "" {
+				outputForUsage.WriteString(step.Fragment)
+				inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(step.Fragment, contentBlockIndex)
+				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
+				for _, chunk := range sseData {
+					if len(chunk) > 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
 					}
 				}
+			}
 
+			if step.Completed != nil {
+				hasToolUses = true
 				blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
-				sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
+				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 				for _, chunk := range sseData {
 					if len(chunk) > 0 {
 						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
@@ -2854,8 +2902,6 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 				out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
 			}
 		}
-	} else if pendingReasoning.Len() > 0 {
-		log.Warn("kiro: dropping unsigned reasoning at end of stream")
 	}
 	if isTextBlockOpen && contentBlockIndex >= 0 {
 		blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)

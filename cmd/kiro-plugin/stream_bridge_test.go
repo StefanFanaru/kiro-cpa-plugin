@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -205,5 +206,49 @@ func TestCollectStreamReturnsErrorInsteadOfEncodingIt(t *testing.T) {
 	var body synchronousStreamResponse
 	if err := json.Unmarshal(env.Result, &body); err != nil || len(body.Chunks) != 2 {
 		t.Fatalf("chunks = %+v (%v), want 2 payload chunks", body.Chunks, err)
+	}
+}
+
+// CPA 8.0.42 reads a stream's status and retry-after from error_detail
+// (stream_bridge.go rpcStreamCloseRequest, shaped as pluginabi.Error); the
+// plain "error" stays for older hosts. Decoded here with the host's field
+// names, not the plugin's struct, so a renamed tag fails the test.
+func TestStreamCloseCarriesStatusAndRetryAfterInErrorDetail(t *testing.T) {
+	var raw []byte
+	original := streamHostCall
+	streamHostCall = func(method string, request []byte) ([]byte, error) {
+		if method == pluginabi.MethodHostStreamClose {
+			raw = append([]byte(nil), request...)
+		}
+		return okEnvelope(struct{}{})
+	}
+	t.Cleanup(func() { streamHostCall = original })
+
+	window := 90 * time.Second
+	streamClose("s9", requestStatusError{status: 429, retryAfter: &window})
+	var host struct {
+		StreamID    string `json:"stream_id"`
+		Error       string `json:"error"`
+		ErrorDetail *struct {
+			Code              string `json:"code"`
+			Message           string `json:"message"`
+			HTTPStatus        int    `json:"http_status"`
+			RetryAfterSeconds int    `json:"retry_after_seconds"`
+		} `json:"error_detail"`
+	}
+	if err := json.Unmarshal(raw, &host); err != nil {
+		t.Fatal(err)
+	}
+	if host.StreamID != "s9" || host.Error == "" {
+		t.Fatalf("close = %s, want the plain error kept for older hosts", raw)
+	}
+	if host.ErrorDetail == nil || host.ErrorDetail.HTTPStatus != 429 || host.ErrorDetail.RetryAfterSeconds != 90 || host.ErrorDetail.Message != host.Error {
+		t.Fatalf("close = %s, want error_detail with status 429 and 90 s", raw)
+	}
+
+	raw = nil
+	streamClose("s10", nil)
+	if bytes.Contains(raw, []byte("error")) {
+		t.Fatalf("a clean close carried an error: %s", raw)
 	}
 }

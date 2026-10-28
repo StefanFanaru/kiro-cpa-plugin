@@ -32,21 +32,56 @@ func init() {
 	)
 }
 
+// responsesStreamState carries the slim request across the frames of one
+// stream, next to the host translator's own state.
+type responsesStreamState struct {
+	request []byte
+	inner   any
+}
+
 func convertClaudeStreamToResponses(ctx context.Context, model string, originalRequest, claudeRequest, response []byte, param *any) [][]byte {
 	dataFrame := claudeDataFrame(response)
 	if len(dataFrame) == 0 {
 		return [][]byte{}
 	}
+	if *param == nil {
+		*param = &responsesStreamState{request: slimResponsesRequest(originalRequest)}
+	}
+	state := (*param).(*responsesStreamState)
 	return registry.TranslateStream(
 		ctx,
 		sdktranslator.FormatClaude,
 		sdktranslator.FormatOpenAIResponse,
 		model,
-		originalRequest,
+		state.request,
 		claudeRequest,
 		dataFrame,
-		param,
+		&state.inner,
 	)
+}
+
+// slimResponsesRequest drops the conversation input, except additional_tools
+// items, from a Responses request. The host's Claude-to-Responses stream
+// translator parses the request on every frame, but reads only top-level
+// fields and the tools declared in tools and input additional_tools items, so
+// a long conversation cost a full parse per frame: 1.5 ms and 850 KB for an
+// 800 KB request.
+func slimResponsesRequest(original []byte) []byte {
+	input := gjson.GetBytes(original, "input")
+	if !input.IsArray() || !gjson.ValidBytes(original) {
+		return original
+	}
+	kept := make([]string, 0, 1)
+	for _, item := range input.Array() {
+		if item.Get("type").String() == "additional_tools" {
+			kept = append(kept, item.Raw)
+		}
+	}
+	slim, err := sjson.SetRawBytes(original, "input", []byte("["+strings.Join(kept, ",")+"]"))
+	if err != nil {
+		return original
+	}
+	return slim
 }
 
 func convertClaudeNonStreamToResponses(ctx context.Context, model string, originalRequest, claudeRequest, response []byte) []byte {

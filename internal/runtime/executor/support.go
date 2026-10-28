@@ -58,6 +58,12 @@ func normalizeTransportError(err error) error {
 	return upstreamTransportErr{cause: err}
 }
 
+// streamProtocolError reports malformed upstream output without classifying
+// words in its message as a client validation failure.
+func streamProtocolError(message string) error {
+	return statusErr{code: http.StatusBadGateway, msg: "kiro API stream error: " + message}
+}
+
 func streamStatusError(kind, message string) error {
 	text := strings.TrimSpace(message)
 	if text == "" {

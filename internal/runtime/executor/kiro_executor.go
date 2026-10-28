@@ -1846,15 +1846,13 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 	var reasoning *kiroclaude.KiroReasoningContent
 	if redactedReasoning != "" {
 		reasoning = &kiroclaude.KiroReasoningContent{RedactedContent: redactedReasoning}
-	} else if reasoningText.Len() > 0 && reasoningSignature != "" {
+	} else if reasoningText.Len() > 0 {
 		reasoning = &kiroclaude.KiroReasoningContent{
 			ReasoningText: &kiroclaude.KiroReasoningText{
 				Text:      reasoningText.String(),
 				Signature: reasoningSignature,
 			},
 		}
-	} else if reasoningText.Len() > 0 {
-		log.Warn("kiro: dropping unsigned reasoning from buffered response")
 	}
 
 	return cleanedContent, reasoning, toolUses, usageInfo, upstreamContextPercentage, stopReason, nil
@@ -2392,7 +2390,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 
 			// Text inside an open tool_use block would corrupt the block indexes.
 			if currentToolUse != nil && (contentDelta != "" || len(toolUses) > 0) {
-				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", fmt.Sprintf("text arrived during tool call %q", aliases.original(currentToolUse.Name)))}
+				out <- cliproxyexecutor.StreamChunk{Err: streamProtocolError(fmt.Sprintf("text arrived during tool call %q", aliases.original(currentToolUse.Name)))}
 				return false
 			}
 
@@ -2439,7 +2437,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 
 				duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
 				if err != nil {
-					out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", err.Error())}
+					out <- cliproxyexecutor.StreamChunk{Err: streamProtocolError(err.Error())}
 					return false
 				}
 				if duplicate {
@@ -2536,7 +2534,7 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			}
 
 			if currentToolUse != nil && (thinkingText != "" || signature != "" || redactedContent != "") {
-				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", fmt.Sprintf("reasoning arrived during tool call %q", aliases.original(currentToolUse.Name)))}
+				out <- cliproxyexecutor.StreamChunk{Err: streamProtocolError(fmt.Sprintf("reasoning arrived during tool call %q", aliases.original(currentToolUse.Name)))}
 				return false
 			}
 			// An empty delta writes nothing, so it must not start the message: an
@@ -2627,7 +2625,16 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 			}
 
 		case "toolUseEvent":
-			// Handle dedicated tool use events with input buffering
+			step, newState, toolErr := kiroclaude.StreamToolUseEvent(event, currentToolUse, processedIDs)
+			if toolErr != nil {
+				out <- cliproxyexecutor.StreamChunk{Err: streamProtocolError(toolErr.Error())}
+				return false
+			}
+			currentToolUse = newState
+			if !step.Started && step.Fragment == "" && step.Completed == nil {
+				continue
+			}
+			emitMessageStart()
 			if isThinkingBlockOpen {
 				blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
@@ -2638,14 +2645,6 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 				}
 				isThinkingBlockOpen = false
 			}
-
-			step, newState, toolErr := kiroclaude.StreamToolUseEvent(event, currentToolUse, processedIDs)
-			if toolErr != nil {
-				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", toolErr.Error())}
-				return false
-			}
-			emitMessageStart()
-			currentToolUse = newState
 
 			// Input fragments are forwarded as they arrive: a large tool input
 			// otherwise leaves the client without an event until it is complete.

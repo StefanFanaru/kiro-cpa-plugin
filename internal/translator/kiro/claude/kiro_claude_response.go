@@ -10,7 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// BuildClaudeResponse preserves text, signed or redacted reasoning, and tool
+// BuildClaudeResponse preserves text, reasoning, and tool
 // arguments returned by Kiro. It never manufactures reasoning metadata.
 func BuildClaudeResponse(content string, reasoning *KiroReasoningContent, toolUses []KiroToolUse, model string, usageInfo usage.Detail, stopReason string) []byte {
 	contentBlocks := make([]map[string]interface{}, 0, len(toolUses)+2)
@@ -20,12 +20,15 @@ func BuildClaudeResponse(content string, reasoning *KiroReasoningContent, toolUs
 				"type": "redacted_thinking",
 				"data": reasoning.RedactedContent,
 			})
-		} else if reasoning.ReasoningText != nil && reasoning.ReasoningText.Text != "" && reasoning.ReasoningText.Signature != "" {
-			contentBlocks = append(contentBlocks, map[string]interface{}{
-				"type":      "thinking",
-				"thinking":  reasoning.ReasoningText.Text,
-				"signature": reasoning.ReasoningText.Signature,
-			})
+		} else if reasoning.ReasoningText != nil && reasoning.ReasoningText.Text != "" {
+			block := map[string]interface{}{
+				"type":     "thinking",
+				"thinking": reasoning.ReasoningText.Text,
+			}
+			if reasoning.ReasoningText.Signature != "" {
+				block["signature"] = reasoning.ReasoningText.Signature
+			}
+			contentBlocks = append(contentBlocks, block)
 		}
 	}
 	if content != "" {

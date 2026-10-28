@@ -158,5 +158,8 @@ func TestTextDuringOpenToolBlockFailsTheStream(t *testing.T) {
 		if ok || streamErr == nil {
 			t.Errorf("%s: ok=%v err=%v, want the stream to fail", name, ok, streamErr)
 		}
+		if status, _ := streamErr.(interface{ StatusCode() int }); status == nil || status.StatusCode() != http.StatusBadGateway {
+			t.Errorf("%s: protocol error = %v, want 502", name, streamErr)
+		}
 	}
 }

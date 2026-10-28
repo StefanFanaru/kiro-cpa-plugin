@@ -310,6 +310,63 @@ func TestMonthlyLimitAndSuspensionParkTheCredentialLocally(t *testing.T) {
 	}
 }
 
+// A request the plugin refuses on its own (expired token, unsupported
+// request) never reaches Kiro, so it must not take the credential's pacing
+// slot: reserving the slot first made the next real request on that credential
+// wait out a 1-2s gap that protected nothing.
+func TestLocallyRefusedRequestDoesNotTakeAPacingSlot(t *testing.T) {
+	expiredAuth := func(id string) *cliproxyauth.Auth {
+		auth := builderIDAuth(id)
+		auth.Metadata["expires_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		return auth
+	}
+	unsupported := func() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
+		request, options := executorTestRequest()
+		body := []byte("{\"model\":\"claude-haiku-4.5\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK.\"}],\"response_format\":{\"type\":\"json_object\"}}")
+		request.Payload, options.OriginalRequest = body, body
+		return request, options
+	}
+	for _, test := range []struct {
+		name    string
+		auth    func(string) *cliproxyauth.Auth
+		request func() (cliproxyexecutor.Request, cliproxyexecutor.Options)
+		want    int
+	}{
+		{name: "expired token", auth: expiredAuth, request: executorTestRequest, want: http.StatusUnauthorized},
+		{name: "unsupported request", auth: builderIDAuth, request: unsupported, want: http.StatusBadRequest},
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s stream=%v", test.name, stream), func(t *testing.T) {
+				stubUpstream(t, func(*http.Request) (*http.Response, error) {
+					return upstreamStatus(http.StatusOK, nil, ""), nil
+				})
+				kiroauth.ConfigureGlobalRateLimiter(kiroauth.RateLimiterConfig{MinTokenInterval: 2 * time.Second, MaxTokenInterval: 2 * time.Second})
+				id := fmt.Sprintf("refused-%s-%v", strings.ReplaceAll(test.name, " ", "-"), stream)
+				execute := func(auth *cliproxyauth.Auth, request cliproxyexecutor.Request, options cliproxyexecutor.Options) error {
+					if stream {
+						_, err := NewKiroExecutor(nil).ExecuteStream(t.Context(), auth, request, options)
+						return err
+					}
+					_, err := NewKiroExecutor(nil).Execute(t.Context(), auth, request, options)
+					return err
+				}
+
+				request, options := test.request()
+				err := execute(test.auth(id), request, options)
+				if status, ok := err.(interface{ StatusCode() int }); !ok || status.StatusCode() != test.want {
+					t.Fatalf("refused request = %T %v, want %d", err, err, test.want)
+				}
+				request, options = executorTestRequest()
+				start := time.Now()
+				_ = execute(builderIDAuth(id), request, options)
+				if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+					t.Fatalf("next request on the credential waited %v for a slot the refused one took", elapsed)
+				}
+			})
+		}
+	}
+}
+
 // Retry sleeps end with the caller: a client that disconnects while the plugin
 // waits out a 503 gets 499 immediately instead of holding the credential.
 func TestRetryBackoffStopsWhenTheClientDisconnects(t *testing.T) {
@@ -492,5 +549,26 @@ func TestUnavailableStatusByReason(t *testing.T) {
 		if got := unavailableStatus(reason); got != want {
 			t.Fatalf("unavailableStatus(%q) = %d, want %d", reason, got, want)
 		}
+	}
+}
+
+// A non-stream request reads the whole generation before it returns, so a
+// client timeout caps generation length: long Opus runs failed at 120s and
+// CPA retried them to 480s. Only the caller's context may bound the request.
+func TestNonStreamClientHasNoTimeout(t *testing.T) {
+	original := kiroHTTPClientFor
+	t.Cleanup(func() { kiroHTTPClientFor = original })
+	var timeouts []time.Duration
+	kiroHTTPClientFor = func(_ context.Context, _ *config.Config, _ *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+		timeouts = append(timeouts, timeout)
+		return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return upstreamStatus(http.StatusTooManyRequests, nil, "{\"message\":\"stop\"}"), nil
+		})}
+	}
+	request, options := executorTestRequest()
+
+	_, _ = NewKiroExecutor(nil).Execute(t.Context(), builderIDAuth("non-stream-timeout"), request, options)
+	if len(timeouts) != 1 || timeouts[0] != 0 {
+		t.Fatalf("non-stream client timeouts = %v, want [0]", timeouts)
 	}
 }

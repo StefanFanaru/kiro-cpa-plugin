@@ -52,6 +52,16 @@ const (
 	proxyIdleConnTimeout     = 90 * time.Second
 )
 
+// http2HealthCheck makes an HTTP/2 connection that has received nothing for
+// SendPingTimeout send a ping, and closes it when the ping is not answered
+// within PingTimeout. Without it a connection whose peer went silent, with no
+// FIN or RST, stays in the pool: every request for every credential sharing the
+// transport is multiplexed onto it and fails only at ResponseHeaderTimeout. A
+// live peer answers the ping, so a long quiet generation is not cut off.
+func http2HealthCheck() *http.HTTP2Config {
+	return &http.HTTP2Config{SendPingTimeout: 30 * time.Second, PingTimeout: 15 * time.Second}
+}
+
 // proxyTransportTimings returns the timings every proxy transport shares,
 // whatever its scheme.
 func proxyTransportTimings() *http.Transport {
@@ -69,6 +79,7 @@ func proxyTransportTimings() *http.Transport {
 		MaxIdleConnsPerHost: proxyMaxIdleConnsPerHost,
 		MaxConnsPerHost:     proxyMaxConnsPerHost,
 		IdleConnTimeout:     proxyIdleConnTimeout,
+		HTTP2:               http2HealthCheck(),
 	}
 }
 

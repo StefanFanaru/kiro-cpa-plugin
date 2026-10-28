@@ -78,94 +78,21 @@ const (
 	kiroSocketMaxRetryDelay  = 30 * time.Second
 )
 
-// retryableErrorPatterns are transport error messages worth a second attempt,
-// matched against the lowercased error text.
-var retryableErrorPatterns = []string{
-	"connection reset",
-	"connection refused",
-	"broken pipe",
-	"timeout",
-	"temporary failure",
-	"no such host",
-	"network is unreachable",
-	"i/o timeout",
-}
-
-// isRetryableError checks if an error is retryable based on error type and message.
-// Returns true for network timeouts, connection resets, and temporary failures.
-// Based on kiro2Api's retry logic patterns.
+// isRetryableError recognizes transport error values, independent of OS error text.
 func isRetryableError(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-
-	// Check for context cancellation - not retryable
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-
-	// Check for net.Error (timeout, temporary)
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		if netErr.Timeout() {
-			log.Debugf("kiro: isRetryableError: network timeout detected")
-			return true
-		}
-		// Note: Temporary() is deprecated but still useful for some error types
-	}
-
-	// Check for specific syscall errors (connection reset, broken pipe, etc.)
-	var syscallErr syscall.Errno
-	if errors.As(err, &syscallErr) {
-		switch syscallErr {
-		case syscall.ECONNRESET: // Connection reset by peer
-			log.Debugf("kiro: isRetryableError: ECONNRESET detected")
-			return true
-		case syscall.ECONNREFUSED: // Connection refused
-			log.Debugf("kiro: isRetryableError: ECONNREFUSED detected")
-			return true
-		case syscall.EPIPE: // Broken pipe
-			log.Debugf("kiro: isRetryableError: EPIPE (broken pipe) detected")
-			return true
-		case syscall.ETIMEDOUT: // Connection timed out
-			log.Debugf("kiro: isRetryableError: ETIMEDOUT detected")
-			return true
-		case syscall.ENETUNREACH: // Network is unreachable
-			log.Debugf("kiro: isRetryableError: ENETUNREACH detected")
-			return true
-		case syscall.EHOSTUNREACH: // No route to host
-			log.Debugf("kiro: isRetryableError: EHOSTUNREACH detected")
-			return true
-		}
-	}
-
-	// Check for net.OpError wrapping other errors
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		log.Debugf("kiro: isRetryableError: net.OpError detected, op=%s", opErr.Op)
-		// Recursively check the wrapped error
-		if opErr.Err != nil {
-			return isRetryableError(opErr.Err)
-		}
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
 		return true
 	}
-
-	// Check error message for retryable patterns
-	errMsg := strings.ToLower(err.Error())
-	for _, pattern := range retryableErrorPatterns {
-		if strings.Contains(errMsg, pattern) {
-			log.Debugf("kiro: isRetryableError: pattern '%s' matched in error: %s", pattern, errMsg)
+	for _, cause := range []error{syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.EPIPE, syscall.ETIMEDOUT, syscall.ENETUNREACH, syscall.EHOSTUNREACH, io.EOF, io.ErrUnexpectedEOF} {
+		if errors.Is(err, cause) {
 			return true
 		}
 	}
-
-	// Check for EOF which may indicate connection was closed
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		log.Debugf("kiro: isRetryableError: EOF/UnexpectedEOF detected")
-		return true
-	}
-
-	return false
+	return isRetryablePlatformSocketError(err)
 }
 
 // calculateRetryDelay is the wait before retrying the same request. Tests
@@ -220,6 +147,9 @@ func getKiroPooledHTTPClient() *http.Client {
 
 			// Enable HTTP/2 when available
 			ForceAttemptHTTP2: true,
+
+			// Drop an HTTP/2 connection whose peer went silent
+			HTTP2: http2HealthCheck(),
 		}
 
 		kiroHTTPClientPool = &http.Client{
@@ -753,12 +683,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
 
-	tokenKey := getTokenKey(auth)
-	if err := admitCredential(ctx, auth, tokenKey); err != nil {
-		return resp, err
-	}
-
-	if e.isTokenExpired(accessToken) {
+	if e.isTokenExpired(auth, accessToken) {
 		return resp, errAccessTokenExpired
 	}
 
@@ -774,6 +699,13 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	kiroModelID := e.mapModelToKiro(req.Model)
 	if err := prepareModelCapability(auth, kiroModelID, req.Payload, &opts); err != nil {
+		return resp, err
+	}
+
+	// Admitted last: a request refused by the checks above never reaches Kiro
+	// and must not take the credential's pacing slot.
+	tokenKey := getTokenKey(auth)
+	if err := admitCredential(ctx, auth, tokenKey); err != nil {
 		return resp, err
 	}
 
@@ -836,8 +768,10 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			AuthValue: authValue,
 		})
 
-		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 120*time.Second)
-		httpResp, err := httpClient.Do(httpReq)
+		// No client timeout: it covers the whole body, so it would cap generation
+		// length. The caller's context and ResponseHeaderTimeout still apply.
+		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
+		httpResp, sent, err := sendUpstream(httpClient, httpReq)
 		if err != nil {
 			// Check for context cancellation first - client disconnected, not a server error
 			// Use 499 (Client Closed Request - nginx convention) instead of 500
@@ -855,7 +789,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			recordAPIResponseError(ctx, e.cfg, err)
 
-			if isRetryableError(err) && attempt < maxRetries {
+			// Only a request that never left is retried: once it was written,
+			// Kiro may already be generating, and billing, the answer.
+			if !sent && isRetryableError(err) && attempt < maxRetries {
 				delay := calculateRetryDelay(attempt)
 				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("socket error: %v", err), delay, endpoint.Name)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
@@ -1012,12 +948,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
 
-	tokenKey := getTokenKey(auth)
-	if err := admitCredential(ctx, auth, tokenKey); err != nil {
-		return nil, err
-	}
-
-	if e.isTokenExpired(accessToken) {
+	if e.isTokenExpired(auth, accessToken) {
 		return nil, errAccessTokenExpired
 	}
 
@@ -1033,6 +964,13 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	kiroModelID := e.mapModelToKiro(req.Model)
 	if err := prepareModelCapability(auth, kiroModelID, req.Payload, &opts); err != nil {
+		return nil, err
+	}
+
+	// Admitted last: a request refused by the checks above never reaches Kiro
+	// and must not take the credential's pacing slot.
+	tokenKey := getTokenKey(auth)
+	if err := admitCredential(ctx, auth, tokenKey); err != nil {
 		return nil, err
 	}
 
@@ -1100,11 +1038,13 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		})
 
 		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
-		httpResp, err := httpClient.Do(httpReq)
+		httpResp, sent, err := sendUpstream(httpClient, httpReq)
 		if err != nil {
 			recordAPIResponseError(ctx, e.cfg, err)
 
-			if isRetryableError(err) && attempt < maxRetries {
+			// Only a request that never left is retried: once it was written,
+			// Kiro may already be generating, and billing, the answer.
+			if !sent && isRetryableError(err) && attempt < maxRetries {
 				delay := calculateRetryDelay(attempt)
 				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("stream socket error: %v", err), delay, endpoint.Name)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
@@ -1350,6 +1290,10 @@ func (e *EventStreamError) Error() string {
 	}
 	return fmt.Sprintf("event stream %s: %s", e.Type, e.Message)
 }
+
+// Unwrap exposes the read error, so a timeout or cancellation is classified
+// as one rather than as a generic connection failure.
+func (e *EventStreamError) Unwrap() error { return e.Cause }
 
 // eventStreamMessage represents a parsed AWS Event Stream message
 type eventStreamMessage struct {
@@ -2973,11 +2917,24 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 // NOTE: Claude SSE event builders moved to internal/translator/kiro/claude/kiro_claude_stream.go
 // The executor now uses kiroclaude.BuildClaude*Event() functions instead
 
-// isTokenExpired checks if a JWT access token has expired.
-// Returns true if the token is expired or cannot be parsed.
-func (e *KiroExecutor) isTokenExpired(accessToken string) bool {
+// isTokenExpired checks if the access token has expired. The expiry the
+// credential records decides when it is readable, as cmd/kiro-plugin's
+// accessTokenExpired reads it: Kiro IdC access tokens are opaque, so only a JWT
+// carries its own expiry, which is the fallback. API keys do not expire.
+func (e *KiroExecutor) isTokenExpired(auth *cliproxyauth.Auth, accessToken string) bool {
 	if accessToken == "" {
 		return true
+	}
+	if isAPIKeyAuth(auth) {
+		return false
+	}
+	if auth != nil {
+		for _, key := range []string{"expires_at", "expiresAt"} {
+			value, _ := auth.Metadata[key].(string)
+			if expiresAt, err := time.Parse(time.RFC3339, strings.TrimSpace(value)); err == nil {
+				return !expiresAt.After(time.Now())
+			}
+		}
 	}
 
 	// JWT tokens have 3 parts separated by dots

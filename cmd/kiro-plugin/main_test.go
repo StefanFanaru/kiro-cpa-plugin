@@ -383,23 +383,34 @@ func TestErrorEnvelopePreservesHTTPStatus(t *testing.T) {
 	}
 }
 
-func TestErrorEnvelopeCarriesRetryAfterInMilliseconds(t *testing.T) {
-	window := 90 * time.Minute
-	raw := errorEnvelopeFromError(requestStatusError{status: http.StatusTooManyRequests, retryAfter: &window})
-	var decoded envelope
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if decoded.Error == nil || decoded.Error.RetryAfterMS != window.Milliseconds() || !decoded.Error.Retryable {
-		t.Fatalf("error envelope = %#v", decoded.Error)
-	}
-	if !bytes.Contains(raw, []byte(`"retry_after_ms":5400000`)) {
-		t.Fatalf("wire format lacks retry_after_ms: %s", raw)
+// CPA 8.0.42 reads the window as pluginabi.Error.RetryAfterSeconds
+// (json:"retry_after_seconds") and cools a 429 for exactly that long.
+func TestErrorEnvelopeCarriesRetryAfterInSeconds(t *testing.T) {
+	for _, test := range []struct {
+		window time.Duration
+		want   string
+	}{
+		{90 * time.Minute, `"retry_after_seconds":5400`},
+		{1500 * time.Millisecond, `"retry_after_seconds":2`},
+		{time.Millisecond, `"retry_after_seconds":1`},
+	} {
+		window := test.window
+		raw := errorEnvelopeFromError(requestStatusError{status: http.StatusTooManyRequests, retryAfter: &window})
+		var decoded envelope
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Error == nil || decoded.Error.HTTPStatus != http.StatusTooManyRequests || !decoded.Error.Retryable {
+			t.Fatalf("error envelope = %#v", decoded.Error)
+		}
+		if !bytes.Contains(raw, []byte(test.want)) {
+			t.Fatalf("window %v: wire format lacks %s: %s", test.window, test.want, raw)
+		}
 	}
 
-	raw = errorEnvelopeFromError(requestStatusError{status: http.StatusTooManyRequests})
-	if bytes.Contains(raw, []byte("retry_after_ms")) {
-		t.Fatalf("retry_after_ms emitted without a window: %s", raw)
+	raw := errorEnvelopeFromError(requestStatusError{status: http.StatusTooManyRequests})
+	if bytes.Contains(raw, []byte("retry_after")) {
+		t.Fatalf("a retry-after was emitted without a window: %s", raw)
 	}
 }
 
@@ -902,6 +913,30 @@ func TestConfigurePluginIgnoresNonSettingsKiroKeys(t *testing.T) {
 	configurePlugin(configureRequest("oauth-excluded-models:\n  kiro:\n    - claude-sonnet-4\n    - kiro/auto\nplugins:\n  configs:\n    kiro:\n      min_token_interval: 8s\n"))
 	if pluginSettings.MinTokenInterval != "8s" || pluginSettings.SuspendCooldown != "2h" {
 		t.Fatalf("excluded-models list interfered with settings: %#v", pluginSettings)
+	}
+}
+
+func TestReconfigureKeepsParkedCredential(t *testing.T) {
+	configurePlugin(nil)
+	kiroauth.GetGlobalRateLimiter().MarkUnavailable("token-abc", kiroauth.ReasonMonthlyLimit, time.Hour)
+	configurePlugin(nil)
+	if _, _, unavailable := kiroauth.GetGlobalRateLimiter().TokenUnavailable("token-abc"); !unavailable {
+		t.Fatal("reconfigure forgot that the credential is out of rotation for its monthly limit")
+	}
+}
+
+func TestReconfigureKeepsPacing(t *testing.T) {
+	configurePlugin(nil)
+	if err := kiroauth.GetGlobalRateLimiter().WaitForToken(context.Background(), "token-pace"); err != nil {
+		t.Fatal(err)
+	}
+	configurePlugin(nil)
+	start := time.Now()
+	if err := kiroauth.GetGlobalRateLimiter().WaitForToken(context.Background(), "token-pace"); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(start); waited < 500*time.Millisecond {
+		t.Fatalf("second request on the same credential waited %v after reconfigure; pacing was reset", waited)
 	}
 }
 

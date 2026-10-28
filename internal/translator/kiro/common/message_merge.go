@@ -3,6 +3,7 @@ package common
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/tidwall/gjson"
 )
@@ -16,100 +17,99 @@ func MergeAdjacentMessages(messages []gjson.Result) []gjson.Result {
 		return messages
 	}
 
-	var merged []gjson.Result
-	for _, msg := range messages {
-		if len(merged) == 0 {
-			merged = append(merged, msg)
-			continue
-		}
-
-		lastMsg := merged[len(merged)-1]
-		currentRole := msg.Get("role").String()
-		lastRole := lastMsg.Get("role").String()
-
+	merged := make([]gjson.Result, 0, len(messages))
+	for start := 0; start < len(messages); {
+		role := messages[start].Get("role").String()
+		end := start + 1
 		// Don't merge tool messages - each has a unique tool_call_id
-		if currentRole == "tool" || lastRole == "tool" {
-			merged = append(merged, msg)
-			continue
+		for role != "tool" && end < len(messages) && messages[end].Get("role").String() == role {
+			end++
 		}
-
-		if currentRole == lastRole {
-			// Merge content from current message into last message
-			mergedContent := mergeMessageContent(lastMsg, msg)
-			var mergedToolCalls []interface{}
-			if currentRole == "assistant" {
-				// Preserve assistant tool_calls when adjacent assistant messages are merged.
-				mergedToolCalls = mergeToolCalls(lastMsg.Get("tool_calls"), msg.Get("tool_calls"))
-			}
-
-			// Start from the original message so provider-specific metadata (for
-			// example reasoning_content, refusal, name, or annotations) is not
-			// silently discarded while adjacent content is coalesced.
-			mergedMsg := createMergedMessageFrom(lastMsg, lastRole, mergedContent, mergedToolCalls)
-			merged[len(merged)-1] = gjson.Parse(mergedMsg)
+		if end-start == 1 {
+			merged = append(merged, messages[start])
 		} else {
-			merged = append(merged, msg)
+			merged = append(merged, mergeRun(messages[start:end], role))
 		}
+		start = end
 	}
 
 	return merged
 }
 
-// mergeMessageContent merges the content of two messages with the same role.
-// Handles both string content and array content (with text, tool_use, tool_result blocks).
-func mergeMessageContent(msg1, msg2 gjson.Result) string {
-	content1 := msg1.Get("content")
-	content2 := msg2.Get("content")
+// mergeRun merges a run of adjacent same-role messages into one message. The
+// run's content blocks are collected first and serialized once, and joined
+// text is concatenated once per block: rebuilding the merged message or the
+// joined text after every member made a long run quadratic.
+func mergeRun(run []gjson.Result, role string) gjson.Result {
+	var blocks []map[string]interface{}
+	// Texts still to be joined into the last block.
+	var joinedText []string
+	var toolCalls []interface{}
+	for _, msg := range run {
+		next := contentBlocks(msg.Get("content"))
 
-	// Extract content blocks from both messages
-	var blocks1, blocks2 []map[string]interface{}
-
-	if content1.IsArray() {
-		for _, block := range content1.Array() {
-			blocks1 = append(blocks1, blockToMap(block))
-		}
-	} else if content1.Type == gjson.String {
-		blocks1 = append(blocks1, map[string]interface{}{
-			"type": "text",
-			"text": content1.String(),
-		})
-	}
-
-	if content2.IsArray() {
-		for _, block := range content2.Array() {
-			blocks2 = append(blocks2, blockToMap(block))
-		}
-	} else if content2.Type == gjson.String {
-		blocks2 = append(blocks2, map[string]interface{}{
-			"type": "text",
-			"text": content2.String(),
-		})
-	}
-
-	// Merge text blocks if both end/start with text. A block declaring
-	// type "text" is not proof that "text" holds a string: the client sends
-	// this JSON, so null or a number reaches the map as nil or float64 and an
-	// unchecked assertion would panic. A panic here kills the whole CPA
-	// process, because neither cliproxyPluginCall nor the host's C bridge
-	// recovers. Blocks that do not carry two strings are left unmerged.
-	if len(blocks1) > 0 && len(blocks2) > 0 {
-		if blocks1[len(blocks1)-1]["type"] == "text" && blocks2[0]["type"] == "text" {
-			text1, ok1 := blocks1[len(blocks1)-1]["text"].(string)
-			text2, ok2 := blocks2[0]["text"].(string)
-			if ok1 && ok2 {
-				// Merge the last text block of msg1 with the first text block of msg2
-				blocks1[len(blocks1)-1]["text"] = text1 + "\n" + text2
-				blocks2 = blocks2[1:] // Remove the merged block from blocks2
+		// Merge text blocks if both end/start with text. A block declaring
+		// type "text" is not proof that "text" holds a string: the client sends
+		// this JSON, so null or a number reaches the map as nil or float64 and an
+		// unchecked assertion would panic. A panic here kills the whole CPA
+		// process, because neither cliproxyPluginCall nor the host's C bridge
+		// recovers. Blocks that do not carry two strings are left unmerged.
+		if len(blocks) > 0 && len(next) > 0 {
+			if blocks[len(blocks)-1]["type"] == "text" && next[0]["type"] == "text" {
+				text1, ok1 := blocks[len(blocks)-1]["text"].(string)
+				text2, ok2 := next[0]["text"].(string)
+				if ok1 && ok2 {
+					// Merge the last text block so far with the first text block of this message
+					if len(joinedText) == 0 {
+						joinedText = append(joinedText, text1)
+					}
+					joinedText = append(joinedText, text2)
+					next = next[1:] // Remove the merged block from next
+				}
 			}
 		}
+		if len(next) > 0 {
+			joinLastText(blocks, joinedText)
+			joinedText = joinedText[:0]
+			blocks = append(blocks, next...)
+		}
+
+		if role == "assistant" {
+			// Preserve assistant tool_calls when adjacent assistant messages are merged.
+			toolCalls = appendToolCalls(toolCalls, msg.Get("tool_calls"))
+		}
 	}
+	joinLastText(blocks, joinedText)
+	content, _ := json.Marshal(blocks)
 
-	// Combine all blocks
-	allBlocks := append(blocks1, blocks2...)
+	// Start from the original message so provider-specific metadata (for
+	// example reasoning_content, refusal, name, or annotations) is not
+	// silently discarded while adjacent content is coalesced.
+	return gjson.Parse(createMergedMessageFrom(run[0], role, string(content), toolCalls))
+}
 
-	// Convert to JSON
-	result, _ := json.Marshal(allBlocks)
-	return string(result)
+// contentBlocks returns the blocks of a message's content.
+// Handles both string content and array content (with text, tool_use, tool_result blocks).
+func contentBlocks(content gjson.Result) []map[string]interface{} {
+	var blocks []map[string]interface{}
+	if content.IsArray() {
+		for _, block := range content.Array() {
+			blocks = append(blocks, blockToMap(block))
+		}
+	} else if content.Type == gjson.String {
+		blocks = append(blocks, map[string]interface{}{
+			"type": "text",
+			"text": content.String(),
+		})
+	}
+	return blocks
+}
+
+// joinLastText sets the text of the last block to texts joined by newlines.
+func joinLastText(blocks []map[string]interface{}, texts []string) {
+	if len(texts) > 0 {
+		blocks[len(blocks)-1]["text"] = strings.Join(texts, "\n")
+	}
 }
 
 // blockToMap converts a gjson.Result block to a map[string]interface{}
@@ -151,20 +151,12 @@ func createMergedMessageFrom(original gjson.Result, role, content string, toolCa
 	return string(result)
 }
 
-// mergeToolCalls combines tool_calls from two assistant messages while preserving order.
-func mergeToolCalls(tc1, tc2 gjson.Result) []interface{} {
-	var merged []interface{}
-
-	if tc1.IsArray() {
-		for _, tc := range tc1.Array() {
+// appendToolCalls appends an assistant message's tool_calls, preserving order.
+func appendToolCalls(merged []interface{}, toolCalls gjson.Result) []interface{} {
+	if toolCalls.IsArray() {
+		for _, tc := range toolCalls.Array() {
 			merged = append(merged, tc.Value())
 		}
 	}
-	if tc2.IsArray() {
-		for _, tc := range tc2.Array() {
-			merged = append(merged, tc.Value())
-		}
-	}
-
 	return merged
 }

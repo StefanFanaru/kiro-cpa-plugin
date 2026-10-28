@@ -82,18 +82,18 @@ func TestEventStreamHeadersKeepEveryStringHeader(t *testing.T) {
 
 // A stream with no content block names the credential and lists every frame:
 // status payloads whole, and an exception frame's headers even without a
-// payload. The response itself is unchanged.
+// payload. The exception still fails the response.
 func TestStreamWithoutContentLogsEveryFrame(t *testing.T) {
 	logged := captureLog(t)
 	body := kiroEventStream(
-		headerFrame("", stringHeader(":message-type", "exception"),
-			stringHeader(":exception-type", "ThrottlingException"), stringHeader(":error-message", "Too many requests")),
 		statusEvent("metadataEvent", `{"stopReason":"END_TURN"}`),
 		statusEvent("contextUsageEvent", `{"contextUsagePercentage":18.1}`),
 		statusEvent("meteringEvent", `{"unit":"credit","usage":0.08}`),
+		headerFrame("", stringHeader(":message-type", "exception"),
+			stringHeader(":exception-type", "ThrottlingException"), stringHeader(":error-message", "Too many requests")),
 	)
-	if !runStream(t, withStreamTraceLabel(context.Background(), "cred-a.json"), body) {
-		t.Fatal("the diagnostic changed the stream result")
+	if runStream(t, withStreamTraceLabel(context.Background(), "cred-a.json"), body) {
+		t.Fatal("stream reported success after a ThrottlingException")
 	}
 	line := logged.String()
 	for _, want := range []string{

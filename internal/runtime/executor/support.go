@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"html"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -41,6 +44,92 @@ func (e upstreamTransportErr) Error() string {
 func (e upstreamTransportErr) Unwrap() error   { return e.cause }
 func (e upstreamTransportErr) StatusCode() int { return http.StatusBadGateway }
 
+// upstreamIdleTimeout bounds the silence between two reads of an upstream
+// body. It is not a cap on the answer's length: every read that returns data
+// restarts it. Five minutes is an initial estimate, not a measured upstream
+// limit. Tests shorten it.
+var upstreamIdleTimeout = 5 * time.Minute
+
+// upstreamIdleErr reports a body that delivered nothing for the idle limit.
+// It is a net.Error timeout, so it is classified like any other read timeout.
+type upstreamIdleErr struct{ idle time.Duration }
+
+func (e upstreamIdleErr) Error() string {
+	return fmt.Sprintf("kiro upstream sent no data for %v: i/o timeout", e.idle)
+}
+func (e upstreamIdleErr) Timeout() bool   { return true }
+func (e upstreamIdleErr) Temporary() bool { return true }
+
+// sendUpstream sends req and bounds the silence of the response body. The
+// plugin runs on context.Background() and the streaming path has no client
+// timeout by design, so without this an upstream that sent its headers and
+// then went quiet held the request forever. Each attempt gets its own child
+// context; closing the body releases it.
+//
+// sent reports whether the whole request was written. A transport error after
+// that point does not mean Kiro did not receive the request, so the caller
+// must not send it again: Kiro would generate, and bill, it twice.
+func sendUpstream(client *http.Client, req *http.Request) (resp *http.Response, sent bool, err error) {
+	var written atomic.Bool
+	ctx, cancel := context.WithCancelCause(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				written.Store(true)
+			}
+		},
+	}))
+	resp, err = client.Do(req.WithContext(ctx))
+	if err != nil {
+		cancel(nil)
+		return nil, written.Load(), err
+	}
+	resp.Body = newIdleBody(ctx, cancel, resp.Body)
+	return resp, true, nil
+}
+
+// idleBody cancels its request with upstreamIdleErr when no read returns
+// data for upstreamIdleTimeout, which unblocks a read waiting on a silent
+// connection.
+type idleBody struct {
+	body   io.ReadCloser
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	idle   time.Duration
+	timer  *time.Timer
+}
+
+func newIdleBody(ctx context.Context, cancel context.CancelCauseFunc, body io.ReadCloser) *idleBody {
+	idle := upstreamIdleTimeout
+	return &idleBody{
+		body:   body,
+		ctx:    ctx,
+		cancel: cancel,
+		idle:   idle,
+		timer:  time.AfterFunc(idle, func() { cancel(upstreamIdleErr{idle: idle}) }),
+	}
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+	if n > 0 {
+		b.timer.Reset(b.idle)
+	}
+	if err != nil {
+		var idleErr upstreamIdleErr
+		if errors.As(context.Cause(b.ctx), &idleErr) {
+			err = idleErr
+		}
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.timer.Stop()
+	err := b.body.Close()
+	b.cancel(nil)
+	return err
+}
+
 func normalizeTransportError(err error) error {
 	if err == nil {
 		return nil
@@ -56,6 +145,12 @@ func normalizeTransportError(err error) error {
 		return statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
 	}
 	return upstreamTransportErr{cause: err}
+}
+
+// streamProtocolError reports malformed upstream output without classifying
+// words in its message as a client validation failure.
+func streamProtocolError(message string) error {
+	return statusErr{code: http.StatusBadGateway, msg: "kiro API stream error: " + message}
 }
 
 func streamStatusError(kind, message string) error {

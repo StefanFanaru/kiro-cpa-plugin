@@ -112,7 +112,9 @@ const (
 var pluginVersion = "dev"
 
 var (
-	hostAPI        *C.cliproxy_host_api
+	// hostAPI is cleared by the shutdown export while plugin goroutines may
+	// still call back into the host, so it is read and written atomically.
+	hostAPI        atomic.Pointer[C.cliproxy_host_api]
 	pluginConfig   = &config.Config{AuthDir: "~/.cli-proxy-api"}
 	kiroExecutor   = kiroexecutor.NewKiroExecutor(pluginConfig)
 	pluginSettings = defaultPluginSettings()
@@ -155,11 +157,13 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code         string `json:"code"`
-	Message      string `json:"message"`
-	Retryable    bool   `json:"retryable,omitempty"`
-	HTTPStatus   int    `json:"http_status,omitempty"`
-	RetryAfterMS int64  `json:"retry_after_ms,omitempty"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	Retryable  bool   `json:"retryable,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+	// RetryAfterSeconds is pluginabi.Error.RetryAfterSeconds. CPA 8.0.42 and
+	// later cool a 429 for exactly this long; older hosts ignore the field.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 type registration struct {
@@ -203,7 +207,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if plugin == nil {
 		return 1
 	}
-	hostAPI = host
+	hostAPI.Store(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -262,7 +266,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() { hostAPI = nil }
+func cliproxyPluginShutdown() { hostAPI.Store(nil) }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
@@ -1204,6 +1208,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	applyUsageIdentity(resolveAuthFileName(req.Attributes, req.AuthID), refreshed)
 	relistModels(req.AuthID, refreshed)
 	clearUsageCache()
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authDataForHostUpdate(refreshed, req.Attributes, req.AuthID), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})
@@ -1223,9 +1228,6 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	// Returning AuthUpdate during model discovery restores the API-key kind and
 	// api_key attribute in the live auth record without requiring a CPA patch.
 	authUpdated := isAPIKeyCredential(token)
-	lock := credentialUsageLock(token, req.AuthID)
-	lock.Lock()
-	defer lock.Unlock()
 
 	// Registration must not wait on the network. CPA asks every credential in
 	// turn while it starts, after its port is already open, and every other
@@ -1233,10 +1235,15 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	// 2-8 s after everything else (measured 2026-09-25, starts at 15:29 and
 	// 16:27), so anything reading the model list at startup saw no Kiro models.
 	// The stored listing answers whatever the token's state: it is renewed by
-	// auth.refresh, which CPA schedules off the startup path.
+	// auth.refresh, which CPA schedules off the startup path. It reads only the
+	// request, so it does not queue behind a refresh or usage fetch holding the
+	// credential lock.
 	if stored, ok := storedModelCatalog(token); ok {
 		return modelsResponse(req, token, stored.Models, authUpdated)
 	}
+	lock := credentialUsageLock(token, req.AuthID)
+	lock.Lock()
+	defer lock.Unlock()
 	// Only a credential that has never been listed gets here. Listing never
 	// renews the token; renewal is auth.refresh, scheduled by CPA.
 	now := time.Now()
@@ -2011,17 +2018,36 @@ func collectStream(result *coreexec.StreamResult, cancel context.CancelFunc) ([]
 // Cancelling first makes that finish now rather than when Kiro stops generating.
 func pumpStream(streamID string, chunks <-chan coreexec.StreamChunk, cancel context.CancelFunc) {
 	var streamErr error
+	emitting, closeHost := false, true
 	defer func() {
 		cancel()
 		drainStream(chunks)
-		streamClose(streamID, streamErr)
+		if closeHost {
+			streamClose(streamID, streamErr)
+		}
+	}()
+	// This goroutine runs outside callHandler's recover, and a panic in a
+	// plugin goroutine ends the CPA process. A panic in the host emit leaves the
+	// host alone; any other closes the stream with an error.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("kiro: panic pumping stream %s: %v\n%s", streamID, recovered, debug.Stack())
+			closeHost = !emitting
+			streamErr = pluginStatusError{status: http.StatusInternalServerError, message: "kiro: internal error streaming the response"}
+		}
 	}()
 	for chunk := range chunks {
 		if chunk.Err != nil {
 			streamErr = chunk.Err
 			return
 		}
-		if len(chunk.Payload) > 0 && streamEmit(streamID, chunk.Payload) != nil {
+		if len(chunk.Payload) == 0 {
+			continue
+		}
+		emitting = true
+		err := streamEmit(streamID, chunk.Payload)
+		emitting = false
+		if err != nil {
 			return
 		}
 	}
@@ -2107,7 +2133,8 @@ func validateRegion(region string) error {
 }
 
 func hostCall(method string, request []byte) ([]byte, error) {
-	if hostAPI == nil || hostAPI.call == nil {
+	api := hostAPI.Load()
+	if api == nil || api.call == nil {
 		return nil, errors.New("host API unavailable")
 	}
 	cMethod := C.CString(method)
@@ -2118,13 +2145,13 @@ func hostCall(method string, request []byte) ([]byte, error) {
 		defer C.free(cRequest)
 	}
 	var response C.cliproxy_buffer
-	rc := C.kiro_call_host(hostAPI, cMethod, (*C.uint8_t)(cRequest), C.size_t(len(request)), &response)
+	rc := C.kiro_call_host(api, cMethod, (*C.uint8_t)(cRequest), C.size_t(len(request)), &response)
 	var out []byte
 	if response.ptr != nil && response.len > 0 {
 		out = C.GoBytes(response.ptr, C.int(response.len))
 	}
-	if response.ptr != nil && hostAPI.free_buffer != nil {
-		C.kiro_free_host_buffer(hostAPI, response.ptr, response.len)
+	if response.ptr != nil && api.free_buffer != nil {
+		C.kiro_free_host_buffer(api, response.ptr, response.len)
 	}
 	if rc != 0 {
 		return out, fmt.Errorf("host call %s returned %d", method, int(rc))
@@ -2133,12 +2160,15 @@ func hostCall(method string, request []byte) ([]byte, error) {
 }
 
 // hostStreamMessage mirrors the host's stream.emit and stream.close request
-// shapes. The host reads a stream error only from the top-level "error" field;
-// anything placed in "payload" is delivered to the client as ordinary bytes.
+// shapes. A stream error goes in the top-level "error" field; anything placed
+// in "payload" is delivered to the client as ordinary bytes. CPA 8.0.42 and
+// later prefer "error_detail", which keeps the status and retry-after that
+// decide how long the credential cools; older hosts ignore it and read "error".
 type hostStreamMessage struct {
-	StreamID string `json:"stream_id"`
-	Payload  []byte `json:"payload,omitempty"`
-	Error    string `json:"error,omitempty"`
+	StreamID    string         `json:"stream_id"`
+	Payload     []byte         `json:"payload,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	ErrorDetail *envelopeError `json:"error_detail,omitempty"`
 }
 
 // streamHostCall is swapped by tests that drive pumpStream without a host.
@@ -2174,6 +2204,7 @@ func streamClose(streamID string, err error) {
 	message := hostStreamMessage{StreamID: streamID}
 	if err != nil {
 		message.Error = err.Error()
+		message.ErrorDetail = pluginError(err)
 	}
 	body, _ := json.Marshal(message)
 	_, _ = streamHostCall(pluginabi.MethodHostStreamClose, body)
@@ -2204,29 +2235,34 @@ func errorEnvelopeFromError(err error) []byte {
 	if err == nil {
 		return errorEnvelope("plugin_error", "plugin call failed")
 	}
+	raw, _ := json.Marshal(envelope{OK: false, Error: pluginError(err)})
+	return raw
+}
+
+// pluginError carries an error's HTTP status and retry-after to the host, both
+// in a call's error envelope and as a stream's error_detail.
+func pluginError(err error) *envelopeError {
 	status := 0
 	var statusError interface{ StatusCode() int }
 	if errors.As(err, &statusError) {
 		status = statusError.StatusCode()
 	}
-	// The host's rpcError (7.2.151) does not read retry_after_ms yet; the field
-	// is emitted so a host that learns it can honor the plugin's window instead
-	// of starting its own backoff ladder at one second.
-	var retryAfterMS int64
+	retryAfterSeconds := 0
 	var retryAfterError interface{ RetryAfter() *time.Duration }
 	if errors.As(err, &retryAfterError) {
 		if retryAfter := retryAfterError.RetryAfter(); retryAfter != nil && *retryAfter > 0 {
-			retryAfterMS = retryAfter.Milliseconds()
+			// Rounded up: a window cut short would send the credential back
+			// to Kiro before Kiro accepts it again.
+			retryAfterSeconds = int((*retryAfter + time.Second - 1) / time.Second)
 		}
 	}
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
-		Code:         "plugin_error",
-		Message:      err.Error(),
-		Retryable:    status == http.StatusTooManyRequests || status >= http.StatusInternalServerError,
-		HTTPStatus:   status,
-		RetryAfterMS: retryAfterMS,
-	}})
-	return raw
+	return &envelopeError{
+		Code:              "plugin_error",
+		Message:           err.Error(),
+		Retryable:         status == http.StatusTooManyRequests || status >= http.StatusInternalServerError,
+		HTTPStatus:        status,
+		RetryAfterSeconds: retryAfterSeconds,
+	}
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {

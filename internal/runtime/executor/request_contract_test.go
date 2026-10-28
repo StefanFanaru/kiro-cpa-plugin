@@ -165,19 +165,19 @@ func TestNormalizeKiroToolsBoundsOpenAIFunctionDescription(t *testing.T) {
 	}
 }
 
-func TestNormalizeKiroRequestMovesInlineSystemMessagesToSystemPrompt(t *testing.T) {
+func TestNormalizeKiroRequestKeepsInlineSystemMessagesInPlace(t *testing.T) {
 	body := []byte(`{"system":[{"type":"text","text":"base instructions"}],"messages":[{"role":"user","content":[{"type":"text","text":"finish the task"}]},{"role":"system","content":"session instructions"}]}`)
 
 	normalized, err := normalizeKiroRequest(body, sdktranslator.FormatClaude)
 	if err != nil {
 		t.Fatalf("normalize request: %v", err)
 	}
-	if got := gjson.GetBytes(normalized, "system").String(); got != "base instructions\n\nsession instructions" {
-		t.Fatalf("system prompt = %q", got)
+	if got := gjson.GetBytes(normalized, "system.0.text").String(); got != "base instructions" {
+		t.Fatalf("system prompt = %s", gjson.GetBytes(normalized, "system").Raw)
 	}
-	messages := gjson.GetBytes(normalized, "messages").Array()
-	if len(messages) != 1 || messages[0].Get("role").String() != "user" {
-		t.Fatalf("normalized messages = %s", gjson.GetBytes(normalized, "messages").Raw)
+	messages := gjson.GetBytes(normalized, "messages")
+	if len(messages.Array()) != 1 || messages.Get("0.role").String() != "user" || messages.Get("0.content.#.text").Raw != `["finish the task\nsession instructions"]` {
+		t.Fatalf("normalized messages = %s", messages.Raw)
 	}
 	if err = validateKiroRequest(body, normalized, sdktranslator.FormatClaude); err != nil {
 		t.Fatalf("normalized request rejected: %v", err)
@@ -191,8 +191,59 @@ func TestNormalizeKiroRequestPreservesInlineSystemTextBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalize request: %v", err)
 	}
-	if got := gjson.GetBytes(normalized, "system").String(); got != "first\n\nsecond" {
-		t.Fatalf("system prompt = %q", got)
+	if got := gjson.GetBytes(normalized, "messages.0.content.#.text").Raw; got != `["finish\nfirst","second"]` {
+		t.Fatalf("inline system text = %s", got)
+	}
+}
+
+// Kiro caches the request prefix. A client such as Claude Code appends a fresh
+// system message on every turn; folding it into the system prompt, which is
+// sent ahead of the first user turn, changed the oldest history entry on every
+// request and made every turn a cache miss.
+func TestInlineSystemMessagesDoNotChangeEarlierKiroHistory(t *testing.T) {
+	turn := func(reminder string) []byte {
+		body := []byte(`{"system":"base","messages":[{"role":"user","content":"start"},{"role":"assistant","content":"working"},{"role":"user","content":"continue"},{"role":"system","content":"` + reminder + `"}]}`)
+		normalized, err := normalizeKiroRequest(body, sdktranslator.FormatClaude)
+		if err != nil {
+			t.Fatalf("normalize request: %v", err)
+		}
+		payload, _ := buildKiroPayloadForFormat(normalized, "claude-opus-5.5", "", "AI_EDITOR", sdktranslator.FormatClaude, nil)
+		return payload
+	}
+	first, second := turn("tokens left: 900"), turn("tokens left: 800")
+	if a, b := gjson.GetBytes(first, "conversationState.history").Raw, gjson.GetBytes(second, "conversationState.history").Raw; a != b {
+		t.Fatalf("history differs between turns:\n%s\n%s", a, b)
+	}
+	if got := gjson.GetBytes(second, "conversationState.currentMessage.userInputMessage.content").String(); got != "continue\ntokens left: 800" {
+		t.Fatalf("current content = %q", got)
+	}
+}
+
+func TestTrailingInlineSystemMessageBecomesCurrentKiroInput(t *testing.T) {
+	for _, tc := range []struct {
+		name, messages, want string
+		wantHistory          int
+	}{
+		{"after user", `[{"role":"user","content":"continue"},{"role":"system","content":"reminder"}]`, "base\n\ncontinue\nreminder", 0},
+		{"after assistant", `[{"role":"user","content":"start"},{"role":"assistant","content":"working"},{"role":"system","content":"reminder"}]`, "reminder", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"system":"base","messages":` + tc.messages + `}`)
+			normalized, err := normalizeKiroRequest(body, sdktranslator.FormatClaude)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateKiroRequest(body, normalized, sdktranslator.FormatClaude); err != nil {
+				t.Fatal(err)
+			}
+			payload, _ := buildKiroPayloadForFormat(normalized, "claude-opus-5.5", "", "AI_EDITOR", sdktranslator.FormatClaude, nil)
+			if got := gjson.GetBytes(payload, "conversationState.currentMessage.userInputMessage.content").String(); got != tc.want {
+				t.Fatalf("current input = %q, want %q", got, tc.want)
+			}
+			if got := len(gjson.GetBytes(payload, "conversationState.history").Array()); got != tc.wantHistory {
+				t.Fatalf("history length = %d, want %d", got, tc.wantHistory)
+			}
+		})
 	}
 }
 

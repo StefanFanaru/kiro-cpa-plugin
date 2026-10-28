@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	kiroclaude "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/claude"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -43,7 +44,7 @@ func TestParseEventStreamAccumulatesFragmentedSignedReasoning(t *testing.T) {
 	}
 }
 
-func TestStreamBuffersReasoningUntilSignatureAndKeepsItOutOfVisibleText(t *testing.T) {
+func TestStreamKeepsSignedReasoningOutOfVisibleText(t *testing.T) {
 	t.Parallel()
 
 	body := kiroEventStream(
@@ -90,6 +91,44 @@ func TestStreamBuffersReasoningUntilSignatureAndKeepsItOutOfVisibleText(t *testi
 	}
 	if strings.Index(strings.Join(deltaTypes, ","), "thinking_delta") > strings.Index(strings.Join(deltaTypes, ","), "signature_delta") {
 		t.Fatalf("signature preceded thinking: %v", deltaTypes)
+	}
+}
+
+// Kiro signs reasoning only after its last fragment, which can be minutes
+// later. Holding the fragments until then left the client with message_start
+// and nothing else, and Claude Code abandons a stream silent for five minutes.
+func TestStreamForwardsReasoningBeforeItsSignature(t *testing.T) {
+	t.Parallel()
+
+	upstream, writer := io.Pipe()
+	defer upstream.Close()
+	out := make(chan cliproxyexecutor.StreamChunk, 32)
+	go func() {
+		defer close(out)
+		(&KiroExecutor{}).streamToChannel(context.Background(), upstream, out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0)
+	}()
+	go func() {
+		_, _ = writer.Write(kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"text":"first thought"}}`))
+	}()
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case chunk := <-out:
+			if chunk.Err != nil {
+				t.Fatal(chunk.Err)
+			}
+			data := eventData(chunk.Payload)
+			if data.Get("delta.type").String() == "thinking_delta" {
+				if got := data.Get("delta.thinking").String(); got != "first thought" {
+					t.Fatalf("thinking = %q", got)
+				}
+				_ = writer.Close()
+				return
+			}
+		case <-timeout:
+			t.Fatal("no thinking_delta reached the client before the signature")
+		}
 	}
 }
 
@@ -324,4 +363,64 @@ func eventData(frame []byte) gjson.Result {
 		}
 	}
 	return gjson.Result{}
+}
+
+func TestUnsignedReasoningMatchesStreamAndBufferedResponse(t *testing.T) {
+	t.Parallel()
+	body := kiroEventStream(
+		kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"text":"checking "}}`),
+		kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"text":"the answer"}}`),
+		kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":"visible"}}`),
+	)
+	content, reasoning, tools, usage, _, stop, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := kiroclaude.BuildClaudeResponse(content, reasoning, tools, "claude-opus-5", usage, stop)
+	_, chunks := collectStream(t, body)
+	var streamed strings.Builder
+	for _, chunk := range chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		data := eventData(chunk.Payload)
+		if data.Get("delta.type").String() == "thinking_delta" {
+			streamed.WriteString(data.Get("delta.thinking").String())
+		}
+	}
+	blocks := gjson.GetBytes(response, "content").Array()
+	if len(blocks) != 2 || blocks[0].Get("type").String() != "thinking" || blocks[0].Get("thinking").String() != streamed.String() || streamed.String() != "checking the answer" {
+		t.Fatalf("buffered response %s does not preserve streamed reasoning %q", response, streamed.String())
+	}
+	if blocks[0].Get("signature").Exists() {
+		t.Fatalf("manufactured signature in %s", response)
+	}
+}
+
+func TestDuplicateToolEventDoesNotSplitThinkingBlock(t *testing.T) {
+	t.Parallel()
+	tool := kiroEvent("toolUseEvent", `{"toolUseEvent":{"toolUseId":"call_1","name":"read_file","input":{},"stop":true}}`)
+	body := kiroEventStream(tool,
+		kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"text":"one"}}`),
+		tool,
+		kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"text":"two"}}`),
+		kiroEvent("reasoningContentEvent", `{"reasoningContentEvent":{"signature":"signed"}}`),
+	)
+	ok, chunks := collectStream(t, body)
+	if !ok {
+		t.Fatal("stream failed")
+	}
+	starts := 0
+	for _, chunk := range chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		data := eventData(chunk.Payload)
+		if data.Get("type").String() == "content_block_start" && data.Get("content_block.type").String() == "thinking" {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("thinking blocks = %d, want 1 despite the duplicate tool event", starts)
+	}
 }

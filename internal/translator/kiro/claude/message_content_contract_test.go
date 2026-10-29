@@ -341,3 +341,34 @@ func TestToolInputNumbersRemainExactAfterAdjacentAssistantMerge(t *testing.T) {
 		}
 	}
 }
+
+func TestUndeclaredToolPairsKeepBlankLineSeparators(t *testing.T) {
+	t.Parallel()
+	payload := buildTestPayload(t, `{
+  "messages":[
+   {"role":"user","content":"run both"},
+   {"role":"assistant","content":[
+    {"type":"tool_use","id":"a","name":"GoneA","input":{}},
+    {"type":"tool_use","id":"b","name":"GoneB","input":{}}
+   ]},
+   {"role":"user","content":[
+    {"type":"tool_result","tool_use_id":"a","content":"first"},
+    {"type":"tool_result","tool_use_id":"b","content":"second"}
+   ]}
+  ],
+  "tools":[{"name":"Available","description":"Available","input_schema":{"type":"object"}}]
+ }`)
+	assistant := payload.ConversationState.History[1].AssistantResponseMessage
+	if len(assistant.ToolUses) != 0 {
+		t.Fatal("undeclared tools were not flattened")
+	}
+	wantUses := "<tool_use id=\"a\" name=\"GoneA\">\n{}\n</tool_use>\n\n<tool_use id=\"b\" name=\"GoneB\">\n{}\n</tool_use>"
+	if assistant.Content != wantUses {
+		t.Errorf("flattened tool uses = %q, want %q", assistant.Content, wantUses)
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	wantResults := "<tool_result id=\"a\" status=\"success\">\nfirst\n</tool_result>\n\n<tool_result id=\"b\" status=\"success\">\nsecond\n</tool_result>"
+	if current.Content != wantResults {
+		t.Errorf("flattened tool results = %q, want %q", current.Content, wantResults)
+	}
+}

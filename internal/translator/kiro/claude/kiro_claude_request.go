@@ -311,7 +311,7 @@ func formatToolUses(toolUses []KiroToolUse) string {
 		input, _ := json.Marshal(toolUse.Input)
 		parts = append(parts, fmt.Sprintf("<tool_use id=%q name=%q>\n%s\n</tool_use>", toolUse.ToolUseID, toolUse.Name, input))
 	}
-	return strings.Join(parts, "")
+	return strings.Join(parts, "\n\n")
 }
 
 func formatToolResults(results []KiroToolResult) string {
@@ -323,7 +323,7 @@ func formatToolResults(results []KiroToolResult) string {
 		}
 		parts = append(parts, fmt.Sprintf("<tool_result id=%q status=%q>\n%s\n</tool_result>", result.ToolUseID, result.Status, strings.Join(texts, "\n")))
 	}
-	return strings.Join(parts, "")
+	return strings.Join(parts, "\n\n")
 }
 
 // attachInstructionsToFirstUserMessage preserves system instructions exactly
